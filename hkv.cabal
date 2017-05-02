@@ -34,6 +34,14 @@ test-suite hkv-test
   main-is:             Spec.hs
   build-depends:       base
                      , hkv
+                     , async
+                     , binary
+                     , binary-orphans
+                     , hashable
+                     , list-t
+                     , stm
+                     , stm-containers
+                     , transformers                     
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 
