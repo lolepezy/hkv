@@ -52,7 +52,7 @@ type Idx v = TS.Set v
   The general concept is largely copied from Data.IxSet.Typed
 -}
 data GenStore (ixs :: [*]) (k :: *) (v :: *) where
-  IdxSet :: !(Store k v) -> !(Indexes ixs v) -> GenStore ixs k v
+  IdxSet :: (Eq k, Hashable k) => !(Store k v) -> !(Indexes ixs v) -> GenStore ixs k v
 
 data Indexes (ixs :: [*]) (v :: *) where
   Nil   :: Indexes '[] v
@@ -66,13 +66,13 @@ infixr 5 :+:
 class IdxLookup idxList i v where
   idxLookup :: Proxy idxList -> Proxy i -> Indexes idxList v -> GenIdx i v
 
-instance IdxLookup (i ': ixs) i v where
+instance IdxLookup (ix ': ixs) ix v where
   idxLookup _ _ (iv :+: _) = iv
 
 instance IdxLookup idxList i v => IdxLookup (i1 ': idxList) i v where
   idxLookup pList pI (i :+: ix) = idxLookup (proxyTail pList) pI ix
 
-idxFun :: (v -> ix) -> STM (GenIdx ix v)
+idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix v)
 idxFun f = IdxFun f <$> mkStoreMap
 
 -- k is a primary key, i is an index key
