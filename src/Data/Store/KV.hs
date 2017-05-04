@@ -69,7 +69,7 @@ class IdxLookup idxList i v where
 instance IdxLookup (ix ': ixs) ix v where
   idxLookup _ _ (iv :+: _) = iv
 
-instance IdxLookup idxList i v => IdxLookup (i1 ': idxList) i v where
+instance IdxLookup ixs i v => IdxLookup (i1 ': ixs) i v where
   idxLookup pList pI (i :+: ix) = idxLookup (proxyTail pList) pI ix
 
 idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix v)
@@ -103,9 +103,9 @@ instance (Eq v, Hashable v, UpdateStore idxList v) => UpdateStore (i1 ': idxList
     updateIdxs (proxyTail pList) v ix
 
 
-updateStore :: (Eq k, Hashable k, UpdateStore ixs v) =>
+update :: (Eq k, Hashable k, UpdateStore ixs v) =>
                GenStore ixs k v -> k -> v -> STM (GenStore ixs k v)
-updateStore g@(IdxSet (Store m) indexes) k v =
+update g@(IdxSet (Store m) indexes) k v =
   TM.insert v k m >> updateIdxs Proxy v indexes >> return g
 
 
