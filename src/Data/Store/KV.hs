@@ -1,7 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -14,7 +12,6 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverlappingInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnicodeSyntax #-}
 module Data.Store.KV where
@@ -69,7 +66,7 @@ class IdxLookup idxList i v where
 instance IdxLookup (ix ': ixs) ix v where
   idxLookup _ _ (iv :+: _) = iv
 
-instance IdxLookup ixs i v => IdxLookup (i1 ': ixs) i v where
+instance {-# OVERLAPS #-} IdxLookup ixs i v => IdxLookup (i1 ': ixs) i v where
   idxLookup pList pI (i :+: ix) = idxLookup (proxyTail pList) pI ix
 
 idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix v)
@@ -97,7 +94,8 @@ class UpdateStore idxList v where
 instance UpdateStore '[] v where
   updateIdxs _ _ _ = return ()
 
-instance (Eq v, Hashable v, UpdateStore idxList v) => UpdateStore (i1 ': idxList) v where
+instance {-# OVERLAPS #-} (Eq v, Hashable v, UpdateStore idxList v) =>
+                          UpdateStore (i1 ': idxList) v where
   updateIdxs pList v (i :+: ix) = do
     case i of
       IdxFun idxf idxStore -> do
