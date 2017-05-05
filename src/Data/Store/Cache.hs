@@ -13,7 +13,6 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverlappingInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnicodeSyntax #-}
 module Data.Store.Cache where
@@ -84,7 +83,7 @@ cachedOrIOGeneric :: forall k v t . (Eq k, Hashable k) =>
                        (Key k -> IO t) ->
                        (t -> STM (Maybe (Val v))) ->
                        IO (Maybe (Val v))
-cachedOrIOGeneric kv k fromIO processIO =
+cachedOrIOGeneric kv k fromIO processIOResult =
   join $ atomically $ TM.lookup k kv >>= \case
       Nothing -> do
         let a = async (fromIO k)
@@ -97,7 +96,7 @@ cachedOrIOGeneric kv k fromIO processIO =
                   -- TODO Do something smarter than that
                   Left e  -> writeTVar t (BadThing e) >> return Nothing
                   Right v -> do
-                    v' <- processIO v
+                    v' <- processIOResult v
                     writeTVar t (maybe Absent Memo v')
                     return v'
                 smth      -> val smth
@@ -119,12 +118,16 @@ cachedOrIOGeneric kv k fromIO processIO =
 
 
 getByIdx :: (Eq k, Eq i, Hashable i) =>
-            GenStore idxs k v ->
-            Key i ->
-            (Key i -> IO [Maybe (Val v)]) ->
-            IO [(Key k, Maybe (Val v))]
-getByIdx _ _ _ = do
+            GenStore ixs k v ->
+            i ->
+            (i -> IO [Maybe (Val v)]) ->
+            IO [(k, Maybe (Val v))]
+getByIdx (IdxSet m ixs) i batchIO = do
+  -- cachedOrIOGeneric m i batchIO processIOResult
   return []
+  where
+    processIOResult :: [Maybe (Val v)] -> STM (Maybe (Val v))
+    processIOResult _ = return Nothing
 
 
 
