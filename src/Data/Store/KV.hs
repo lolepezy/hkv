@@ -80,6 +80,14 @@ getIdx :: IdxLookup ixs i v => GenStore ixs k v -> i -> GenIdx i v
 getIdx (IdxSet _ indexes) ik = idxLookup Proxy (Proxy :: Proxy ik) indexes
 
 
+getByIndex :: (Eq i, Hashable i, IdxLookup ixs i v) =>
+              GenStore ixs k v -> i -> STM [v]
+getByIndex store i = do
+    let IdxFun _ m = getIdx store i
+    TM.lookup i m >>= \case
+      Just val -> LT.toList (TS.stream val)
+      Nothing  -> return []
+
 {-
 
 -}
