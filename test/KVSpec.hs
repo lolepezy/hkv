@@ -19,6 +19,7 @@ import qualified STMContainers.Set as TS
 import qualified STMContainers.Map as TM
 
 import Control.Concurrent.STM
+import Control.Monad (forM_, forM)
 
 import Data.Hashable
 import Data.List
@@ -50,33 +51,30 @@ mkTestStore = do
     bIdx <- idxFun (\(_, _, b) -> b)
     return $ IdxSet store (sIdx :+: bIdx :+: Nil)
 
-getByIndex :: (Eq i, Hashable i, IdxLookup EntryIdxs i Entry) =>
-              Store_ -> i -> STM [Entry]
-getByIndex gStore aKey = do
-    let IdxFun sf sMap = getIdx gStore aKey
-    Just val <- TM.lookup aKey sMap
-    v <- LT.toList (TS.stream val)
-    return $ sortOn (\(x, _, _) -> x) v
-
+primaryKey :: Entry -> IKey
+primaryKey (pk, _, _) = pk
 
 prop_retrievable_by_idx_after_insert :: Property
 prop_retrievable_by_idx_after_insert = monadicIO $ do
-  e@(k, s, b) <- pick arbitrary
+  -- e@(k, s, b) <- pick arbitrary
+  entries :: [Entry] <- pick arbitrary
   gStore <- run mkTestStore
 
-  run $ atomically $ update gStore k e
+  run $ atomically $ forM_ entries $ \e -> update gStore (primaryKey e) e
 
-  let IdxFun sf sMap = getIdx gStore ("" :: String)
-  let IdxFun bf bMap = getIdx gStore True
+  vs <- run $ atomically $ forM entries $ \e -> do
+    let (pk, s, b) = e
+    v1 <- getByIndex gStore s
+    v2 <- getByIndex gStore b
+    return (e, v1, v2)
 
-  v1 <- run $ atomically $ getByIndex gStore s
-  v2 <- run $ atomically $ getByIndex gStore b
+  assert $ all (\(e, _, v) -> e `elem` v) vs
+  assert $ all (\(e, v, _) -> e `elem` v) vs
 
-  assert $ head v1 == e
-  assert $ head v2 == e
+  assert $ all (\((_, s, _), v, _) -> all (\(_, s', _) -> s' == s) v) vs
+  assert $ all (\((_, _, b), _, v) -> all (\(_, _, b') -> b' == b) v) vs
 
 
 main :: IO ()
 main = do
-  quickCheck prop_retrievable_by_idx_after_insert
   quickCheck prop_retrievable_by_idx_after_insert
