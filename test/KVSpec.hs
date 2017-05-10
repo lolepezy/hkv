@@ -63,15 +63,15 @@ prop_retrievable_by_idx_after_insert = monadicIO $ do
 
   vs <- run $ atomically $ forM entries $ \e -> do
     let (pk, s, b) = e
-    v1 <- getByIndex gStore s
-    v2 <- getByIndex gStore b
+    Just v1 <- getByIndex gStore s
+    Just v2 <- getByIndex gStore b
     return (e, v1, v2)
 
-  assert $ all (\(e, _, v) -> e `elem` v) vs
-  assert $ all (\(e, v, _) -> e `elem` v) vs
+  assert $ all (\(e, _, v) -> e `elem` map snd v) vs
+  assert $ all (\(e, v, _) -> e `elem` map snd v) vs
 
-  assert $ all (\((_, s, _), v, _) -> all (\(_, s', _) -> s' == s) v) vs
-  assert $ all (\((_, _, b), _, v) -> all (\(_, _, b') -> b' == b) v) vs
+  assert $ all (\((_, s, _), v, _) -> all (\(_, s', _) -> s' == s) (map snd v)) vs
+  assert $ all (\((_, _, b), _, v) -> all (\(_, _, b') -> b' == b) (map snd v)) vs
 
 
 main :: IO ()
