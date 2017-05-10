@@ -62,27 +62,134 @@ data Thing a where
 type Stored v = TVar (Thing v)
 type Cache k v = Store (Key k) (Stored v)
 
+{-
+  Use separate "atoms" map for all updates
 
-cachedOnly :: (Eq k, Hashable k) => Cache k v -> Key k -> STM (Maybe (Val v))
+  1) Value update by PK
+    - use normal Promise/Absent/Error logic in atoms
+    - when IO successfully returns do the normal conflict resolution
+      for the given K
+
+  2) Index update:
+    - use Promise/Error logic with index atoms
+    - insert into the index when and only when the "indexCacheOrIO" is requested
+    - after IO action in indexCacheOrIO get the batch of values
+        * update the index with (i, Set v)
+        * for every v in Set v do conflict resolution with the main store
+    - do not insert index entries in any other way
+
+  3) Conflicts
+
+   Promise | PreparedDiff TxId -> rollback TxId
+
+   Promise | update Memo v     -> wait for Promise,
+    then conflict resolution (version/value/source)
+-}
+
+data ValAtom a where
+  BrokenVal   :: SomeException -> ValAtom a
+  PromiseVal  :: !(IO (Async t)) -> ValAtom a
+  PreparedVal :: !(Diff a) -> ValAtom a
+  MemoVal     :: !(Val a)  -> ValAtom a
+
+
+-- TODO There has to be some periodical job to clean this ones up
+data IdxAtom a where
+  FutureAtom :: !(IO (Async [a])) -> IdxAtom a
+  BrokenAtom :: SomeException     -> IdxAtom a
+
+
+newtype Atoms k a = Atoms (StoreMap k a)
+
+
+indexCachedOrIO :: forall pk v i idx .
+                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup idx i pk (Val v)) =>
+                   Atoms i (IdxAtom (pk, Val v)) ->
+                   Atoms pk (ValAtom v) ->
+                   GenStore idx pk (Val v) ->
+                   i ->
+                   (i -> IO [(pk, Val v)]) ->
+                   IO (Either SomeException [(pk, Val v)])
+indexCachedOrIO
+    (Atoms idxAtoms)
+    (Atoms valAtoms)
+    store@(IdxSet (Store storeKV) idxs)
+    i fromIO =
+  join $ atomically $ getByIndex store i >>= \case
+    Nothing -> getOrCreateAtom >>= \case
+        FutureAtom promise ->
+          return $ promise >>= waitCatch >>= processResult
+        BrokenAtom e ->
+          return . return $ Left e
+
+    -- Just values -> return . return $ Right values
+    Just values -> return . return $ Right []
+
+  where
+    getOrCreateAtom :: STM (IdxAtom (pk, Val v))
+    getOrCreateAtom = TM.lookup i idxAtoms >>= \case
+      Nothing -> do
+        let atom = FutureAtom (async (fromIO i))
+        TM.insert atom i idxAtoms
+        return atom
+      Just atom -> return atom
+
+    processResult :: Either SomeException [(pk, Val v)] -> IO (Either SomeException [(pk, Val v)])
+    processResult ioResult = atomically $ do
+      atom' <- TM.lookup i idxAtoms
+      case (atom', ioResult) of
+        (Nothing, _) ->
+          -- That means another client has called 'removeAtom'
+          -- so just don't do anything here
+          return ioResult
+        (Just (BrokenAtom e), Left exception) -> do
+          TM.insert (BrokenAtom exception) i idxAtoms
+          return (Left exception)
+        (_, Right values) -> do
+          updateStore values
+          return (Right values)
+
+      where
+        updateStore :: [(pk, Val v)] -> STM ()
+        updateStore values = do
+          insertIntoIdx store i (map fst values)
+          forM_ values (uncurry resolve)
+          removeAtom
+
+        resolve :: pk -> Val v -> STM ()
+        resolve pk val = TM.lookup pk valAtoms >>= \case
+            Nothing -> TM.insert val pk storeKV
+            Just a  -> case a of
+              BrokenVal e -> TM.insert val pk storeKV
+              MemoVal (Val v' version')  -> do
+                let (Val v version) = val
+                when (version > version') $ TM.insert val pk storeKV
+              _           -> return ()
+
+        removeAtom = TM.delete i idxAtoms
+
+
+
+cachedOnly :: (Eq pk, Hashable pk) => Cache pk v -> Key pk -> STM (Maybe (Val v))
 cachedOnly (Store kv) k = TM.lookup k kv >>= \case
   Nothing -> return Nothing
   Just t  -> readTVar t >>= \case
     Memo v -> return $ Just v
     _      -> return Nothing
 
-cachedOrIO :: (Eq k, Hashable k) =>
-                 Cache k v ->
-                 Key k ->
-                 (Key k -> IO (Maybe (Val v))) ->
+cachedOrIO :: (Eq pk, Hashable pk) =>
+                 Cache pk v ->
+                 Key pk ->
+                 (Key pk -> IO (Maybe (Val v))) ->
                  IO (Maybe (Val v))
 cachedOrIO (Store kv) k fromIO = cachedOrIOGeneric kv k fromIO return
 
-cachedOrIOGeneric :: forall k v t . (Eq k, Hashable k) =>
-                       StoreMap (Key k) (Stored v) ->
-                       Key k ->
-                       (Key k -> IO t) ->
-                       (t -> STM (Maybe (Val v))) ->
-                       IO (Maybe (Val v))
+cachedOrIOGeneric :: (Eq pk, Hashable pk) =>
+                      StoreMap pk (Stored v) ->
+                      pk ->
+                      (pk -> IO t) ->
+                      (t -> STM (Maybe (Val v))) ->
+                      IO (Maybe (Val v))
 cachedOrIOGeneric kv k fromIO processIOResult =
   join $ atomically $ TM.lookup k kv >>= \case
       Nothing -> do
@@ -117,17 +224,22 @@ cachedOrIOGeneric kv k fromIO processIOResult =
 
 
 
-getByIdx :: (Eq k, Eq i, Hashable i) =>
-            GenStore ixs k v ->
+getByIdx :: (Eq pk, Eq i, Hashable i) =>
+            GenStore ixs i (Stored v) ->
             i ->
-            (i -> IO [Maybe (Val v)]) ->
-            IO [(k, Maybe (Val v))]
-getByIdx (IdxSet m ixs) i batchIO = do
-  -- cachedOrIOGeneric m i batchIO processIOResult
+            (i -> IO [(pk, Maybe (Val v))]) ->
+            IO [(pk, Maybe (Val v))]
+getByIdx g@(IdxSet (Store m) ixs) i batchIO = do
+  cachedOrIOGeneric m i batchIO processIOResult
   return []
   where
-    processIOResult :: [Maybe (Val v)] -> STM (Maybe (Val v))
-    processIOResult _ = return Nothing
+    processIOResult :: [(pk, Maybe (Val v))] -> STM (Maybe (Val v))
+    processIOResult batch = do
+      -- void $ sequence_ $ forM_ batch $ \(pk, mv) ->
+      --   case mv of
+      --     Nothing  -> return Nothing
+      --     Just val -> update g pk val
+      return Nothing
 
 
 

@@ -47,73 +47,92 @@ type Idx v = TS.Set v
 {-
   Generic KV store with a bunch of indexes.
   The general concept is largely copied from Data.IxSet.Typed
+
+  - pk is a primary key
+  - ixs can have indexes on any other field (or function)
 -}
-data GenStore (ixs :: [*]) (k :: *) (v :: *) where
-  IdxSet :: (Eq k, Hashable k) => !(Store k v) -> !(Indexes ixs v) -> GenStore ixs k v
+data GenStore (ixs :: [*]) (pk :: *) (v :: *) where
+  IdxSet :: (Eq pk, Hashable pk) => !(Store pk v) -> !(Indexes ixs pk v) -> GenStore ixs pk v
 
-data Indexes (ixs :: [*]) (v :: *) where
-  Nil   :: Indexes '[] v
-  (:+:) :: GenIdx ix v -> Indexes ixs v -> Indexes (ix ': ixs) v
+data Indexes (ixs :: [*]) (pk :: *) (v :: *) where
+  Nil   :: Indexes '[] pk v
+  (:+:) :: GenIdx ix pk v -> Indexes ixs pk v -> Indexes (ix ': ixs) pk v
 
-data GenIdx ix v where
-  IdxFun :: (Eq ix, Hashable ix) => (v -> ix) -> !(StoreMap ix (Idx v)) -> GenIdx ix v
+data GenIdx ix pk v where
+  IdxFun :: (Eq ix, Hashable ix) => (v -> ix) -> !(StoreMap ix (Idx pk)) -> GenIdx ix pk v
 
 infixr 5 :+:
 
-class IdxLookup idxList i v where
-  idxLookup :: Proxy idxList -> Proxy i -> Indexes idxList v -> GenIdx i v
+class IdxLookup idxList i pk v where
+  idxLookup :: Proxy idxList -> Proxy i -> Indexes idxList pk v -> GenIdx i pk v
 
-instance IdxLookup (ix ': ixs) ix v where
+instance IdxLookup (ix ': ixs) ix pk v where
   idxLookup _ _ (iv :+: _) = iv
 
-instance {-# OVERLAPS #-} IdxLookup ixs i v => IdxLookup (i1 ': ixs) i v where
+instance {-# OVERLAPS #-} IdxLookup ixs i pk v => IdxLookup (i1 ': ixs) i pk v where
   idxLookup pList pI (i :+: ix) = idxLookup (proxyTail pList) pI ix
 
-idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix v)
+idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix pk v)
 idxFun f = IdxFun f <$> mkStoreMap
 
 -- k is a primary key, i is an index key
-getIdx :: IdxLookup ixs i v => GenStore ixs k v -> i -> GenIdx i v
+getIdx :: IdxLookup ixs i pk v => GenStore ixs pk v -> i -> GenIdx i pk v
 getIdx (IdxSet _ indexes) ik = idxLookup Proxy (Proxy :: Proxy ik) indexes
 
 
-getByIndex :: (Eq i, Hashable i, IdxLookup ixs i v) =>
-              GenStore ixs k v -> i -> STM [v]
-getByIndex store i = do
+getByIndex :: (Eq i, Hashable i, Eq pk, Hashable pk, IdxLookup ixs i pk v) =>
+              GenStore ixs pk v -> i -> STM (Maybe [(pk, v)])
+getByIndex store@(IdxSet (Store storeKV) idxs) i = do
     let IdxFun _ m = getIdx store i
     TM.lookup i m >>= \case
-      Just val -> LT.toList (TS.stream val)
-      Nothing  -> return []
+      Just val -> do
+        pks <- LT.toList (TS.stream val)
+        rs  <- forM pks $ \pk -> do
+          v <- TM.lookup pk storeKV
+          return (pk, v)
+        return $ Just [ (pk, v) | (pk, Just v) <- rs ]
+      Nothing  -> return Nothing
+
+
+-- TODO this is bit hacky, so here should be some reasonable
+-- explanation why do we only update one but not the others
+insertIntoIdx :: (Eq i, Hashable i, Eq pk, Hashable pk, IdxLookup ixs i pk v) =>
+                 GenStore ixs pk v -> i -> [pk] -> STM ()
+insertIntoIdx store i vs = do
+  let IdxFun _ m = getIdx store i
+  idx <- TS.new
+  forM_ vs (`TS.insert` idx)
+  TM.insert idx i m
+
 
 {-
 
 -}
-class UpdateStore idxList v where
-  updateIdxs :: Proxy idxList -> v -> Indexes idxList v -> STM ()
+class UpdateStore idxList pk v where
+  updateIdxs :: Proxy idxList -> pk -> v -> Indexes idxList pk v -> STM ()
 
-instance UpdateStore '[] v where
-  updateIdxs _ _ _ = return ()
+instance UpdateStore '[] pk v where
+  updateIdxs _ _ _ _ = return ()
 
-instance {-# OVERLAPS #-} (Eq v, Hashable v, UpdateStore idxList v) =>
-                          UpdateStore (i1 ': idxList) v where
-  updateIdxs pList v (i :+: ix) = do
+instance {-# OVERLAPS #-} (Eq pk, Hashable pk, UpdateStore idxList pk v) =>
+                          UpdateStore (i1 ': idxList) pk v where
+  updateIdxs pList pk v (i :+: ix) = do
     case i of
       IdxFun idxf idxStore -> do
         let idxKey = idxf v
         TM.lookup idxKey idxStore >>= \case
           Nothing -> do
             s <- TS.new
-            TS.insert v s
+            TS.insert pk s
             TM.insert s idxKey idxStore
-          Just s -> TS.insert v s
-    updateIdxs (proxyTail pList) v ix
+          Just s -> TS.insert pk s
+    updateIdxs (proxyTail pList) pk v ix
 
 
-update :: (Eq k, Hashable k, UpdateStore ixs v) =>
-               GenStore ixs k v -> k -> v -> STM (GenStore ixs k v)
-update g@(IdxSet (Store m) indexes) k v =
-  TM.insert v k m >> updateIdxs Proxy v indexes >> return g
-
+update :: (Eq pk, Hashable pk, UpdateStore ixs pk v) =>
+               GenStore ixs pk v -> pk -> v -> STM (GenStore ixs pk v)
+update g@(IdxSet (Store m) indexes) pk v =
+  TM.insert v pk m >> updateIdxs Proxy pk v indexes >> return g
 
 
 proxyTail :: Proxy (z ': zs) -> Proxy zs
