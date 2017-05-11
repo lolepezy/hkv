@@ -55,8 +55,9 @@ primaryKey (pk, _, _) = pk
 
 prop_retrievable_by_idx_after_insert :: Property
 prop_retrievable_by_idx_after_insert = monadicIO $ do
-  -- e@(k, s, b) <- pick arbitrary
-  entries :: [Entry] <- pick arbitrary
+  randomEntries :: [Entry] <- pick arbitrary
+  let entries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) randomEntries
+
   gStore <- run mkTestStore
 
   run $ atomically $ forM_ entries $ \e -> update gStore (primaryKey e) e
@@ -66,6 +67,8 @@ prop_retrievable_by_idx_after_insert = monadicIO $ do
     Just v1 <- getByIndex gStore s
     Just v2 <- getByIndex gStore b
     return (e, v1, v2)
+
+  -- run $ print $ show vs
 
   assert $ all (\(e, _, v) -> e `elem` map snd v) vs
   assert $ all (\(e, v, _) -> e `elem` map snd v) vs
