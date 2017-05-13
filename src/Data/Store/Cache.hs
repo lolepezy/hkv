@@ -87,16 +87,15 @@ type Cache k v = Store (Key k) (Stored v)
 -}
 
 data ValAtom a where
-  BrokenVal   :: SomeException -> ValAtom a
-  PromiseVal  :: !(IO (Async t)) -> ValAtom a
-  PreparedVal :: !(Diff a) -> ValAtom a
-  MemoVal     :: !(Val a)  -> ValAtom a
+  BrokenVal   :: !SomeException  -> ValAtom a
+  PromiseVal  :: !(IO (Async (Maybe (Val a)))) -> ValAtom a
+  PreparedVal :: !(Diff a)       -> ValAtom a
 
 
 -- TODO There has to be some periodical job to clean this ones up
 data IdxAtom a where
   FutureAtom :: !(IO (Async [a])) -> IdxAtom a
-  BrokenAtom :: SomeException     -> IdxAtom a
+  BrokenAtom :: !SomeException    -> IdxAtom a
 
 
 newtype Atoms k a = Atoms (StoreMap k a)
@@ -112,18 +111,17 @@ indexCachedOrIO :: forall pk v i idx .
                    IO (Either SomeException [(pk, Val v)])
 indexCachedOrIO
     (Atoms idxAtoms)
-    (Atoms valAtoms)
+    va@(Atoms valAtoms)
     store@(IdxSet (Store storeKV) idxs)
     i fromIO =
   join $ atomically $ getByIndex store i >>= \case
     Nothing -> getOrCreateAtom >>= \case
         FutureAtom promise ->
-          return $ promise >>= waitCatch >>= processResult
+          return $ promise >>= waitCatch >>= atomically . processResult
         BrokenAtom e ->
           return . return $ Left e
 
-    -- Just values -> return . return $ Right values
-    Just values -> return . return $ Right []
+    Just values -> return . return $ Right values
 
   where
     getOrCreateAtom :: STM (IdxAtom (pk, Val v))
@@ -134,8 +132,8 @@ indexCachedOrIO
         return atom
       Just atom -> return atom
 
-    processResult :: Either SomeException [(pk, Val v)] -> IO (Either SomeException [(pk, Val v)])
-    processResult ioResult = atomically $ do
+    processResult :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
+    processResult ioResult = do
       atom' <- TM.lookup i idxAtoms
       case (atom', ioResult) of
         (Nothing, _) ->
@@ -152,37 +150,87 @@ indexCachedOrIO
       where
         updateStore :: [(pk, Val v)] -> STM ()
         updateStore values = do
-          insertIntoIdx store i (map fst values)
-          forM_ values (uncurry resolve)
-          removeAtom
+            insertIntoIdx store i (map fst values)
+            forM_ values (uncurry (resolve store va))
+            TM.delete i idxAtoms
 
-        resolve :: pk -> Val v -> STM ()
-        resolve pk val = TM.lookup pk valAtoms >>= \case
+
+cachedOrIO :: forall pk v ixs .
+              (Eq pk, Hashable pk, Eq v, Hashable v) =>
+              Atoms pk (ValAtom v) ->
+              GenStore ixs pk (Val v) ->
+              pk ->
+              (pk -> IO (Maybe (Val v))) ->
+              IO (Either SomeException (Maybe (Val v)))
+cachedOrIO
+  va@(Atoms valAtoms)
+  store@(IdxSet (Store storeKV) idxs)
+  pk fromIO =
+  join $ atomically $ TM.lookup pk storeKV >>= \case
+      Nothing -> getOrCreateAtom >>= \case
+          PromiseVal promise ->
+              return $ promise >>= waitCatch >>= processResult
+          PreparedVal (Add _) ->
+              return . return $ Right Nothing
+          PreparedVal (Update old _) ->
+              return . return $ Right (Just old)
+          BrokenVal e ->
+              return . return $ Left e
+      Just x  ->
+          return . return $ Right (Just x)
+
+  where
+    getOrCreateAtom :: STM (ValAtom v)
+    getOrCreateAtom = TM.lookup pk valAtoms >>= \case
+      Nothing -> do
+        let atom = PromiseVal (async (fromIO pk))
+        TM.insert atom pk valAtoms
+        return atom
+      Just atom -> return atom
+
+    processResult :: Either SomeException (Maybe (Val v)) -> IO (Either SomeException (Maybe (Val v)))
+    processResult ioResult = atomically $ do
+      atom' <- TM.lookup pk valAtoms
+      case (atom', ioResult) of
+        (Nothing, _) ->
+          -- That means another client has called 'removeAtom'
+          -- so just don't do anything here
+          return ioResult
+        (Just (BrokenVal e), Left exception) -> do
+          TM.insert (BrokenVal exception) pk valAtoms
+          return (Left exception)
+
+        -- TODO Decide what to do in this case
+        (Just _, Left exception) -> do
+          TM.insert (BrokenVal exception) pk valAtoms
+          return (Left exception)
+
+        (_, x@(Right (Just val))) -> do
+          resolve store va pk val
+          TM.delete pk valAtoms
+          return x
+
+
+resolve :: forall pk v ixs .
+           (Eq pk, Hashable pk, Eq v, Hashable v) =>
+           GenStore ixs pk (Val v) ->
+           Atoms pk (ValAtom v) ->
+           pk ->
+           Val v -> STM ()
+resolve
+  (IdxSet (Store storeKV) _)
+  (Atoms atoms)
+  pk
+  val@(Val v version) =
+    TM.lookup pk atoms >>= \case
+        Nothing -> TM.lookup pk storeKV >>= \case
             Nothing -> TM.insert val pk storeKV
-            Just a  -> case a of
-              BrokenVal e -> TM.insert val pk storeKV
-              MemoVal (Val v' version')  -> do
-                let (Val v version) = val
+            Just (Val v' version') ->
                 when (version > version') $ TM.insert val pk storeKV
-              _           -> return ()
+        Just a  -> case a of
+          BrokenVal e -> TM.insert val pk storeKV
+          _           -> return ()
 
-        removeAtom = TM.delete i idxAtoms
-
-
-
-cachedOnly :: (Eq pk, Hashable pk) => Cache pk v -> Key pk -> STM (Maybe (Val v))
-cachedOnly (Store kv) k = TM.lookup k kv >>= \case
-  Nothing -> return Nothing
-  Just t  -> readTVar t >>= \case
-    Memo v -> return $ Just v
-    _      -> return Nothing
-
-cachedOrIO :: (Eq pk, Hashable pk) =>
-                 Cache pk v ->
-                 Key pk ->
-                 (Key pk -> IO (Maybe (Val v))) ->
-                 IO (Maybe (Val v))
-cachedOrIO (Store kv) k fromIO = cachedOrIOGeneric kv k fromIO return
 
 cachedOrIOGeneric :: (Eq pk, Hashable pk) =>
                       StoreMap pk (Stored v) ->
@@ -221,25 +269,6 @@ cachedOrIOGeneric kv k fromIO processIOResult =
          blocked until commit or rollback -}
       _                         -> retry
 
-
-
-
-getByIdx :: (Eq pk, Eq i, Hashable i) =>
-            GenStore ixs i (Stored v) ->
-            i ->
-            (i -> IO [(pk, Maybe (Val v))]) ->
-            IO [(pk, Maybe (Val v))]
-getByIdx g@(IdxSet (Store m) ixs) i batchIO = do
-  cachedOrIOGeneric m i batchIO processIOResult
-  return []
-  where
-    processIOResult :: [(pk, Maybe (Val v))] -> STM (Maybe (Val v))
-    processIOResult batch = do
-      -- void $ sequence_ $ forM_ batch $ \(pk, mv) ->
-      --   case mv of
-      --     Nothing  -> return Nothing
-      --     Just val -> update g pk val
-      return Nothing
 
 
 
