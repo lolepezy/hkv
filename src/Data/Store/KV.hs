@@ -129,6 +129,7 @@ instance {-# OVERLAPS #-} (Eq pk, Hashable pk, UpdateStore idxList pk v) =>
     updateIdxs (proxyTail pList) pk v ix
 
 
+-- TODO handle insertion of duplicate pk's
 update :: (Eq pk, Hashable pk, UpdateStore ixs pk v) =>
                GenStore ixs pk v -> pk -> v -> STM (GenStore ixs pk v)
 update g@(IdxSet (Store m) indexes) pk v =
