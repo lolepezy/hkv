@@ -232,45 +232,6 @@ resolve
           _           -> return ()
 
 
-cachedOrIOGeneric :: (Eq pk, Hashable pk) =>
-                      StoreMap pk (Stored v) ->
-                      pk ->
-                      (pk -> IO t) ->
-                      (t -> STM (Maybe (Val v))) ->
-                      IO (Maybe (Val v))
-cachedOrIOGeneric kv k fromIO processIOResult =
-  join $ atomically $ TM.lookup k kv >>= \case
-      Nothing -> do
-        let a = async (fromIO k)
-        t <- newTVar (Promise a)
-        TM.insert t k kv
-        return $ do
-          v <- waitCatch =<< a
-          atomically $ readTVar t >>= \case
-                Promise _ -> case v of
-                  -- TODO Do something smarter than that
-                  Left e  -> writeTVar t (BadThing e) >> return Nothing
-                  Right v -> do
-                    v' <- processIOResult v
-                    writeTVar t (maybe Absent Memo v')
-                    return v'
-                smth      -> val smth
-      Just x  ->
-        return $ atomically $ readTVar x >>= val
-
-  where
-    val = \case
-      Absent                    -> return Nothing
-      BadThing _                -> return Nothing
-      Memo v                    -> return $ Just v
-      PreparedDiff (Update v _) -> return $ Just v
-      {- FIXME This is a potential problem: if there is PreparedDiff (Add _)
-         waiting for too long to commit, the whole value reading will become
-         blocked until commit or rollback -}
-      _                         -> retry
-
-
-
 
 data Negotiation = Prepared | Rejected | Screwed | Commitable | Commited
   deriving (Eq, Show, Generic, Typeable)
