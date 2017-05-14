@@ -232,6 +232,7 @@ resolve
           _           -> return ()
 
 
+-- TODO Rethink the stuff below
 
 data Negotiation = Prepared | Rejected | Screwed | Commitable | Commited
   deriving (Eq, Show, Generic, Typeable)
