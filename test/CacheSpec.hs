@@ -111,6 +111,10 @@ prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
 
   assert $ null counters1 || all (\(_, Counter c) -> c == 1) counters1
   assert $ all (\(pk, Just (Val (ik, _, b) _)) -> pk == ik) values
+  ve   <- run $ atomically $ let (Atoms a) = valAtoms in TM.null a
+  idxe <- run $ atomically $ let (Atoms a) = idxAtoms in TM.null a
+  assert ve
+  assert idxe
 
 
 prop_idx_cache_or_io_should_invoke_io_exactly_once :: Property
@@ -134,12 +138,11 @@ prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
     Just c <- TM.lookup pk counters
     (pk,) <$> readTVar c
 
-  -- let (IdxSet (Store storeKV) _) = gStore
-  -- values <- run $ atomically $ forM requestIdxKeys $ \pk ->
-  --   (pk,) <$> TM.lookup pk storeKV
-
   assert $ null counters1 || all (\(_, Counter c) -> c == 1) counters1
-  -- assert $ all (\(pk, Just (Val (ik, _, b) _)) -> pk == ik) values
+  ve   <- run $ atomically $ let (Atoms a) = valAtoms in TM.null a
+  idxe <- run $ atomically $ let (Atoms a) = idxAtoms in TM.null a
+  assert ve
+  assert idxe
 
 
 main :: IO ()
