@@ -44,6 +44,10 @@ newtype Store k v = Store (StoreMap k v)
 
 type Idx v = TS.Set v
 
+data TList (ixs :: [*]) (f :: * -> *) where
+  TNil  :: TList '[] f
+  (:-:) :: f ix -> TList ixs f -> TList (ix ': ixs) f
+
 {-
   Generic KV store with a bunch of indexes.
   The general concept is largely copied from Data.IxSet.Typed
@@ -51,52 +55,48 @@ type Idx v = TS.Set v
   - pk is a primary key
   - ixs can have indexes on any other field (or function)
 -}
+
 data GenStore (ixs :: [*]) (pk :: *) (v :: *) where
-  IdxSet :: (Eq pk, Hashable pk) => !(Store pk v) -> !(Indexes ixs pk v) -> GenStore ixs pk v
+  IdxSet :: (Eq pk, Hashable pk) => !(Store pk v) -> !(TList ixs (GenIdx pk v)) -> GenStore ixs pk v
 
-data Indexes (ixs :: [*]) (pk :: *) (v :: *) where
-  Nil   :: Indexes '[] pk v
-  (:+:) :: GenIdx ix pk v -> Indexes ixs pk v -> Indexes (ix ': ixs) pk v
+data GenIdx pk v ix where
+  IdxFun :: (Eq ix, Hashable ix) => (v -> ix) -> !(StoreMap ix (Idx pk)) -> GenIdx pk v ix
 
-data GenIdx ix pk v where
-  IdxFun :: (Eq ix, Hashable ix) => (v -> ix) -> !(StoreMap ix (Idx pk)) -> GenIdx ix pk v
+infixr 5 :-:
 
-infixr 5 :+:
+class TListLookup ixs ix where
+  tlistLookup :: Proxy ixs -> Proxy ix -> TList ixs f -> f ix
 
-class IdxLookup idxList i pk v where
-  idxLookup :: Proxy idxList -> Proxy i -> Indexes idxList pk v -> GenIdx i pk v
+instance TListLookup (ix ': ixs) ix where
+  tlistLookup _ _ (iv :-: _) = iv
 
-instance IdxLookup (ix ': ixs) ix pk v where
-  idxLookup _ _ (iv :+: _) = iv
+instance {-# OVERLAPS #-} TListLookup ixs ix => TListLookup (ix1 ': ixs) ix where
+  tlistLookup pList pI (i :-: ix) = tlistLookup (proxyTail pList) pI ix
 
-instance {-# OVERLAPS #-} IdxLookup ixs i pk v => IdxLookup (i1 ': ixs) i pk v where
-  idxLookup pList pI (i :+: ix) = idxLookup (proxyTail pList) pI ix
-
-idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx ix pk v)
+idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx pk v ix)
 idxFun f = IdxFun f <$> mkStoreMap
 
 -- k is a primary key, i is an index key
-getIdx :: IdxLookup ixs i pk v => GenStore ixs pk v -> i -> GenIdx i pk v
-getIdx (IdxSet _ indexes) ik = idxLookup Proxy (Proxy :: Proxy ik) indexes
+getIdx :: TListLookup ixs ix => GenStore ixs pk v -> i -> GenIdx pk v ix
+getIdx (IdxSet _ indexes) ik = tlistLookup Proxy (Proxy :: Proxy ik) indexes
 
 
-getByIndex :: (Eq i, Hashable i, Eq pk, Hashable pk, IdxLookup ixs i pk v) =>
+getByIndex :: (Eq i, Hashable i, Eq pk, Hashable pk, TListLookup ixs i) =>
               GenStore ixs pk v -> i -> STM (Maybe [(pk, v)])
 getByIndex store@(IdxSet (Store storeKV) idxs) i = do
     let IdxFun _ m = getIdx store i
     TM.lookup i m >>= \case
       Just val -> do
         pks <- LT.toList (TS.stream val)
-        rs  <- forM pks $ \pk -> do
-          v <- TM.lookup pk storeKV
-          return (pk, v)
+        rs  <- forM pks $ \pk ->
+          (pk,) <$> TM.lookup pk storeKV
         return $ Just [ (pk, v) | (pk, Just v) <- rs ]
       Nothing  -> return Nothing
 
 
 -- TODO this is bit hacky, so here should be some reasonable
 -- explanation why do we only update one but not the others
-insertIntoIdx :: (Eq i, Hashable i, Eq pk, Hashable pk, IdxLookup ixs i pk v) =>
+insertIntoIdx :: (Eq i, Hashable i, Eq pk, Hashable pk, TListLookup ixs i) =>
                  GenStore ixs pk v -> i -> [pk] -> STM ()
 insertIntoIdx store i vs = do
   let IdxFun _ m = getIdx store i
@@ -108,15 +108,15 @@ insertIntoIdx store i vs = do
 {-
 
 -}
-class UpdateStore idxList pk v where
-  updateIdxs :: Proxy idxList -> pk -> v -> Indexes idxList pk v -> STM ()
+class UpdateStore ixs pk v where
+  updateIdxs :: Proxy ixs -> pk -> v -> TList ixs (GenIdx pk v) -> STM ()
 
 instance UpdateStore '[] pk v where
   updateIdxs _ _ _ _ = return ()
 
 instance {-# OVERLAPS #-} (Eq pk, Hashable pk, UpdateStore idxList pk v) =>
                           UpdateStore (i1 ': idxList) pk v where
-  updateIdxs pList pk v (i :+: ix) = do
+  updateIdxs pList pk v (i :-: ix) = do
     case i of
       IdxFun idxf idxStore -> do
         let idxKey = idxf v

@@ -54,7 +54,7 @@ mkTestStore = do
     bIdx <- idxFun (\(Val (_, _, b) _) -> b)
     valAtoms <- mkValAtoms
     idxAtoms <- mkIdxAtoms
-    return (IdxSet store (sIdx :+: bIdx :+: Nil), valAtoms, idxAtoms)
+    return (IdxSet store (sIdx :-: bIdx :-: TNil), valAtoms, idxAtoms)
 
 primaryKey :: Entry -> IKey
 primaryKey (pk, _, _) = pk
@@ -133,6 +133,7 @@ prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
           return [ (pk, Val e (Version 0)) | e@(pk, s', _) <- entries, s' == s ]
 
   run $ mapM_ wait results
+
 
   counters1 <- run $ atomically $ forM requestIdxKeys $ \pk -> do
     Just c <- TM.lookup pk counters

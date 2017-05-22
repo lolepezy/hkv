@@ -15,6 +15,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE RecordWildCards #-}
 module Data.Store.Cache where
 
 import Control.Exception
@@ -104,68 +105,49 @@ data IdxAtom a where
 
 newtype Atoms k a = Atoms (StoreMap k a)
 
+newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, Val v)))
 
 data CacheStore pk v ixs = CacheStore {
-  store :: GenStore ixs pk (Val v),
-  -- valAtoms :: Atoms i (IdxAtom (pk, Val v)),
-  idxAtoms :: Atoms pk (ValAtom v)
+  store    :: GenStore ixs pk v,
+  idxAtoms :: TList ixs (AtomIdx pk v),
+  valAtoms :: Atoms pk (ValAtom v)
 }
 
-indexCachedOrIO :: forall pk v i idx .
-                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup idx i pk (Val v), Show pk, Show v) =>
+cachedOrIO_ :: forall pk v ixs .
+               (Eq pk, Hashable pk, Eq v, Hashable v) =>
+               CacheStore pk (Val v) ixs ->
+               pk ->
+               (pk -> IO (Maybe (Val v))) ->
+               IO (Either SomeException (Maybe (Val v)))
+cachedOrIO_ CacheStore { store = store, valAtoms = va } = cachedOrIO va store
+
+{-
+forall pk v i idx .
+                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup idx i pk (Val v)) =>
                    Atoms i (IdxAtom (pk, Val v)) ->
                    Atoms pk (ValAtom (Val v)) ->
                    GenStore idx pk (Val v) ->
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO
-    (Atoms idxAtoms)
-    va@(Atoms valAtoms)
-    store@(IdxSet (Store storeKV) idxs)
-    i fromIO = do
-      x <- join $ atomically $ getByIndex store i >>= \case
-            Just values -> return . return $ Right values
-            Nothing     ->
-              TM.lookup i idxAtoms >>= \case
-                Nothing -> do
-                  TM.insert IOIdx i idxAtoms
-                  return $ mask_ $ do
-                    a <- async (fromIO i)
-                    atomically $ TM.insert (PromiseIdx a) i idxAtoms
-                    return $ Left a
-                Just IOIdx -> retry
-                Just (PromiseIdx a) -> return $ return $ Left a
-      case x of
-        Left a  -> waitCatch a >>= atomically . updateStore
-        Right v -> return $ Right v
+-}
+--
+-- indexCachedOrIO_ :: forall pk v i ixs .
+--                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup ixs i pk (Val v))  =>
+--                    CacheStore pk (Val v) ixs ->
+--                    i ->
+--                    (i -> IO [(pk, Val v)]) ->
+--                    IO (Either SomeException [(pk, Val v)])
+-- indexCachedOrIO_ CacheStore {..} i fromIO =
+--     indexCachedOrIO
 
-  where
-    updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
-    updateStore ioResult = do
-      atom' <- TM.lookup i idxAtoms
-      case (atom', ioResult) of
-        (Nothing, _) ->
-          -- That means another client has called 'removeAtom'
-          -- so just don't do anything here
-          return ioResult
-        (Just (BrokenIdx e), Left exception) -> do
-          TM.insert (BrokenIdx exception) i idxAtoms
-          return (Left exception)
-        (_, Right values) -> do
-          updateStore values
-          return (Right values)
 
-      where
-        updateStore :: [(pk, Val v)] -> STM ()
-        updateStore values = do
-            insertIntoIdx store i (map fst values)
-            forM_ values (uncurry (resolve store va))
-            TM.delete i idxAtoms
+getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> i -> AtomIdx pk v ix
+getIdxAtom CacheStore { idxAtoms = idxAtoms } ik = tlistLookup Proxy (Proxy :: Proxy ik) idxAtoms
 
 
 cachedOrIO :: forall pk v ixs .
-              (Eq pk, Hashable pk, Eq v, Hashable v, Show pk, Show v) =>
+              (Eq pk, Hashable pk, Eq v, Hashable v) =>
               Atoms pk (ValAtom (Val v)) ->
               GenStore ixs pk (Val v) ->
               pk ->
@@ -217,8 +199,61 @@ cachedOrIO
           return x
 
 
+indexCachedOrIO :: forall pk v i idx .
+                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup idx i) =>
+                   Atoms i (IdxAtom (pk, Val v)) ->
+                   Atoms pk (ValAtom (Val v)) ->
+                   GenStore idx pk (Val v) ->
+                   i ->
+                   (i -> IO [(pk, Val v)]) ->
+                   IO (Either SomeException [(pk, Val v)])
+indexCachedOrIO
+    (Atoms idxAtoms)
+    va@(Atoms valAtoms)
+    store@(IdxSet (Store storeKV) idxs)
+    i fromIO = do
+      x <- join $ atomically $ getByIndex store i >>= \case
+            Just values -> return . return $ Right values
+            Nothing     ->
+              TM.lookup i idxAtoms >>= \case
+                Nothing -> do
+                  TM.insert IOIdx i idxAtoms
+                  return $ mask_ $ do
+                    a <- async (fromIO i)
+                    atomically $ TM.insert (PromiseIdx a) i idxAtoms
+                    return $ Left a
+                Just IOIdx -> retry
+                Just (PromiseIdx a) -> return $ return $ Left a
+      case x of
+        Left a  -> waitCatch a >>= atomically . updateStore
+        Right v -> return $ Right v
+
+  where
+    updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
+    updateStore ioResult = do
+      atom' <- TM.lookup i idxAtoms
+      case (atom', ioResult) of
+        (Nothing, _) ->
+          -- That means another client has called 'removeAtom'
+          -- so just don't do anything here
+          return ioResult
+        (Just (BrokenIdx e), Left exception) -> do
+          TM.insert (BrokenIdx exception) i idxAtoms
+          return (Left exception)
+        (_, Right values) -> do
+          updateStore values
+          return (Right values)
+
+      where
+        updateStore :: [(pk, Val v)] -> STM ()
+        updateStore values = do
+            insertIntoIdx store i (map fst values)
+            forM_ values (uncurry (resolve store va))
+            TM.delete i idxAtoms
+
+
 resolve :: forall pk v ixs .
-           (Eq pk, Hashable pk, Eq v, Hashable v, Show pk, Show v) =>
+           (Eq pk, Hashable pk, Eq v, Hashable v) =>
            GenStore ixs pk (Val v) ->
            Atoms pk (ValAtom (Val v)) ->
            pk ->
