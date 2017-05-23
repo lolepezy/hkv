@@ -15,7 +15,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnicodeSyntax #-}
-{-# LANGUAGE RecordWildCards #-}
 module Data.Store.Cache where
 
 import Control.Exception
@@ -63,7 +62,6 @@ data Thing a where
 
 
 type Stored v = TVar (Thing v)
-type Cache k v = Store (Key k) (Stored v)
 
 {-
   Use separate "atoms" map for all updates
@@ -105,7 +103,7 @@ data IdxAtom a where
 
 newtype Atoms k a = Atoms (StoreMap k a)
 
-newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, Val v)))
+newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, v)))
 
 data CacheStore pk v ixs = CacheStore {
   store    :: GenStore ixs pk v,
@@ -121,25 +119,15 @@ cachedOrIO_ :: forall pk v ixs .
                IO (Either SomeException (Maybe (Val v)))
 cachedOrIO_ CacheStore { store = store, valAtoms = va } = cachedOrIO va store
 
-{-
-forall pk v i idx .
-                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup idx i pk (Val v)) =>
-                   Atoms i (IdxAtom (pk, Val v)) ->
-                   Atoms pk (ValAtom (Val v)) ->
-                   GenStore idx pk (Val v) ->
+indexCachedOrIO_ :: forall pk v i ixs .
+                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup ixs i)  =>
+                   CacheStore pk (Val v) ixs ->
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
--}
---
--- indexCachedOrIO_ :: forall pk v i ixs .
---                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, IdxLookup ixs i pk (Val v))  =>
---                    CacheStore pk (Val v) ixs ->
---                    i ->
---                    (i -> IO [(pk, Val v)]) ->
---                    IO (Either SomeException [(pk, Val v)])
--- indexCachedOrIO_ CacheStore {..} i fromIO =
---     indexCachedOrIO
+indexCachedOrIO_ cs @ CacheStore { store = store, valAtoms = valAtoms } i fromIO =
+    let AtomIdx idxAtoms = getIdxAtom cs i
+    in indexCachedOrIO idxAtoms valAtoms store i fromIO
 
 
 getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> i -> AtomIdx pk v ix
