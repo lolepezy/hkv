@@ -8,12 +8,12 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE RankNTypes #-}
 module Data.Store.KV where
 
 
@@ -48,6 +48,34 @@ data TList (ixs :: [*]) (f :: * -> *) where
   TNil  :: TList '[] f
   (:-:) :: f ix -> TList ixs f -> TList (ix ': ixs) f
 
+
+infixr 5 :-:
+
+class TListLookup ixs ix where
+  tlistLookup :: Proxy ixs -> Proxy ix -> TList ixs f -> f ix
+
+instance TListLookup (ix ': ixs) ix where
+  tlistLookup _ _ (iv :-: _) = iv
+
+instance {-# OVERLAPS #-} TListLookup ixs ix => TListLookup (ix1 ': ixs) ix where
+  tlistLookup pList pI (i :-: ix) = tlistLookup (proxyTail pList) pI ix
+
+class TListGen ixs (g :: * -> *) where
+  genTList  :: (forall ix . g ix) -> TList ixs g
+  genTListM :: Monad m => (forall ix . m (g ix)) -> m (TList ixs g)
+
+instance TListGen '[] g where
+  genTList _  = TNil
+  genTListM _ = return TNil
+
+instance TListGen ixs g => TListGen (ix ': ixs) g where
+  genTList g = g :-: genTList g
+  genTListM g = do
+    g' <- g
+    t <- genTListM g
+    return $ g' :-: t
+
+
 {-
   Generic KV store with a bunch of indexes.
   The general concept is largely copied from Data.IxSet.Typed
@@ -61,17 +89,6 @@ data GenStore (ixs :: [*]) (pk :: *) (v :: *) where
 
 data GenIdx pk v ix where
   IdxFun :: (Eq ix, Hashable ix) => (v -> ix) -> !(StoreMap ix (Idx pk)) -> GenIdx pk v ix
-
-infixr 5 :-:
-
-class TListLookup ixs ix where
-  tlistLookup :: Proxy ixs -> Proxy ix -> TList ixs f -> f ix
-
-instance TListLookup (ix ': ixs) ix where
-  tlistLookup _ _ (iv :-: _) = iv
-
-instance {-# OVERLAPS #-} TListLookup ixs ix => TListLookup (ix1 ': ixs) ix where
-  tlistLookup pList pI (i :-: ix) = tlistLookup (proxyTail pList) pI ix
 
 idxFun :: (Eq ix, Hashable ix) => (v -> ix) -> STM (GenIdx pk v ix)
 idxFun f = IdxFun f <$> mkStoreMap
