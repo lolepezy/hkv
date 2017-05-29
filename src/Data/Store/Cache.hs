@@ -53,15 +53,6 @@ data Diff a = Add !a |
               Update !a !a deriving (Eq, Show, Ord, Generic, Typeable)
 instance Binary a => Binary (Diff a)
 
-data Thing a where
-  Absent       :: Thing a
-  BadThing     :: SomeException -> Thing a
-  Promise      :: !(IO (Async t)) -> Thing a
-  PreparedDiff :: !(Diff a) -> Thing a
-  Memo         :: !(Val a)  -> Thing a
-
-
-type Stored v = TVar (Thing v)
 
 {-
   Use separate "atoms" map for all updates
@@ -111,37 +102,47 @@ data CacheStore pk v ixs = CacheStore {
   valAtoms :: Atoms pk (ValAtom v)
 }
 
-cachedOrIO_ :: forall pk v ixs .
+
+cacheStore :: (Eq pk, Hashable pk, TListGen ixs (AtomIdx pk v)) =>
+              TList ixs (GenIdx pk v) -> STM (CacheStore pk v ixs)
+cacheStore indexes = do
+  store <- mkStore
+  valAtoms <- TM.new
+  idxAtoms <- genTListM (AtomIdx . Atoms <$> TM.new)
+  return $ CacheStore (IdxSet store indexes) idxAtoms (Atoms valAtoms)
+
+
+cachedOrIO :: forall pk v ixs .
                (Eq pk, Hashable pk, Eq v, Hashable v) =>
                CacheStore pk (Val v) ixs ->
                pk ->
                (pk -> IO (Maybe (Val v))) ->
                IO (Either SomeException (Maybe (Val v)))
-cachedOrIO_ CacheStore { store = store, valAtoms = va } = cachedOrIO va store
+cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
 
-indexCachedOrIO_ :: forall pk v i ixs .
+indexCachedOrIO :: forall pk v i ixs .
                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup ixs i)  =>
                    CacheStore pk (Val v) ixs ->
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO_ cs @ CacheStore { store = store, valAtoms = valAtoms } i fromIO =
+indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i fromIO =
     let AtomIdx idxAtoms = getIdxAtom cs i
-    in indexCachedOrIO idxAtoms valAtoms store i fromIO
+    in indexCachedOrIO_ idxAtoms valAtoms store i fromIO
 
 
 getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> i -> AtomIdx pk v ix
 getIdxAtom CacheStore { idxAtoms = idxAtoms } ik = tlistLookup Proxy (Proxy :: Proxy ik) idxAtoms
 
 
-cachedOrIO :: forall pk v ixs .
+cachedOrIO_ :: forall pk v ixs .
               (Eq pk, Hashable pk, Eq v, Hashable v) =>
               Atoms pk (ValAtom (Val v)) ->
               GenStore ixs pk (Val v) ->
               pk ->
               (pk -> IO (Maybe (Val v))) ->
               IO (Either SomeException (Maybe (Val v)))
-cachedOrIO
+cachedOrIO_
   va@(Atoms valAtoms)
   store@(IdxSet (Store storeKV) idxs)
   pk fromIO = do
@@ -187,7 +188,7 @@ cachedOrIO
           return x
 
 
-indexCachedOrIO :: forall pk v i idx .
+indexCachedOrIO_ :: forall pk v i idx .
                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup idx i) =>
                    Atoms i (IdxAtom (pk, Val v)) ->
                    Atoms pk (ValAtom (Val v)) ->
@@ -195,7 +196,7 @@ indexCachedOrIO :: forall pk v i idx .
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO
+indexCachedOrIO_
     (Atoms idxAtoms)
     va@(Atoms valAtoms)
     store@(IdxSet (Store storeKV) idxs)
