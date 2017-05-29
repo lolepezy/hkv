@@ -35,10 +35,20 @@ import qualified STMContainers.Set as TS
 import qualified STMContainers.Map as TM
 
 import Data.Store.KV
+import Data.Store.Cache
 
 data Negotiation = Prepared | Rejected | Screwed | Commitable | Commited
   deriving (Eq, Show, Generic, Typeable)
 instance Binary Negotiation
+
+data Thing a where
+  Absent       :: Thing a
+  BadThing     :: SomeException -> Thing a
+  Promise      :: !(IO (Async t)) -> Thing a
+  PreparedDiff :: !(Diff a) -> Thing a
+  Memo         :: !(Val a)  -> Thing a
+
+type Stored v = TVar (Thing v)
 
 
 -- prepareStore :: (Eq k, Hashable k) =>
