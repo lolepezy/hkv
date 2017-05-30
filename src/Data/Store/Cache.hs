@@ -131,7 +131,7 @@ indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i fromIO 
     in indexCachedOrIO_ idxAtoms valAtoms store i fromIO
 
 
-getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> i -> AtomIdx pk v ix
+getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> ix -> AtomIdx pk v ix
 getIdxAtom CacheStore { idxAtoms = idxAtoms } ik = tlistLookup Proxy (Proxy :: Proxy ik) idxAtoms
 
 
