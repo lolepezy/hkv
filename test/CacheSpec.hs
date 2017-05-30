@@ -81,11 +81,23 @@ inc pk counters = do
   Just c <- TM.lookup pk counters
   modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
 
+uniqueEntries :: Monad m => PropertyM m [Entry]
+uniqueEntries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) <$> pick arbitrary
+
+atomsAreEmpty :: Cache.CacheStore IKey (Cache.Val Entry) EntryIdxs -> STM (Bool, Bool, Bool)
+atomsAreEmpty store = do
+  let (Cache.Atoms valAtoms) = Cache.valAtoms store
+  let (Cache.AtomIdx (Cache.Atoms sIdx)) = Cache.getIdxAtom store ("" :: String)
+  let (Cache.AtomIdx (Cache.Atoms bIdx)) = Cache.getIdxAtom store (True :: Bool)
+  be <- TM.null bIdx
+  se <- TM.null sIdx
+  ve <- TM.null valAtoms
+  return (be, se, ve)
+
 
 prop_cache_or_io_should_invoke_io_exactly_once :: Property
 prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
-  randomEntries :: [Entry] <- pick arbitrary
-  let entries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) randomEntries
+  entries <- uniqueEntries
 
   store <- run mkTestStore
 
@@ -108,16 +120,15 @@ prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
 
   assert $ null counters1 || all (\(_, Counter c) -> c == 1) counters1
   assert $ all (\(pk, Just (Cache.Val (ik, _, b) _)) -> pk == ik) values
-  ve   <- run $ atomically $ let (Cache.Atoms a) = Cache.valAtoms store in TM.null a
-  -- idxe <- run $ atomically $ let (Atoms a) = idxAtoms in TM.null a
+  (be, se, ve) <- run $ atomically $ atomsAreEmpty store
+  assert be
+  assert se
   assert ve
-  -- assert idxe
 
 
 prop_idx_cache_or_io_should_invoke_io_exactly_once :: Property
 prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
-  randomEntries :: [Entry] <- pick arbitrary
-  let entries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) randomEntries
+  entries <- uniqueEntries
 
   store <- run mkTestStore
 
@@ -131,16 +142,15 @@ prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
 
   run $ mapM_ wait results
 
-
   counters1 <- run $ atomically $ forM requestIdxKeys $ \pk -> do
     Just c <- TM.lookup pk counters
     (pk,) <$> readTVar c
 
   assert $ null counters1 || all (\(_, Counter c) -> c == 1) counters1
-  ve   <- run $ atomically $ let (Cache.Atoms a) = Cache.valAtoms store in TM.null a
-  -- idxe <- run $ atomically $ let (Cache.Atoms a) = Cache.idxAtoms store in TM.null a
+  (be, se, ve) <- run $ atomically $ atomsAreEmpty store
+  assert be
+  assert se
   assert ve
-  -- assert idxe
 
 
 
