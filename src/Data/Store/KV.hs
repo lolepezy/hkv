@@ -38,7 +38,6 @@ import GHC.Generics (Generic)
 
 import qualified ListT as LT
 
-
 type StoreMap k v = TM.Map k v
 newtype Store k v = Store (StoreMap k v)
 
@@ -60,6 +59,7 @@ instance TListLookup (ix ': ixs) ix where
 instance {-# OVERLAPS #-} TListLookup ixs ix => TListLookup (ix1 ': ixs) ix where
   tlistLookup pList pI (i :-: ix) = tlistLookup (proxyTail pList) pI ix
 
+
 class TListGen ixs (g :: * -> *) where
   genTList  :: (forall ix . g ix) -> TList ixs g
   genTListM :: Monad m => (forall ix . m (g ix)) -> m (TList ixs g)
@@ -69,7 +69,7 @@ instance TListGen '[] g where
   genTListM _ = return TNil
 
 instance TListGen ixs g => TListGen (ix ': ixs) g where
-  genTList g = g :-: genTList g
+  genTList  g = g :-: genTList g
   genTListM g = do
     g' <- g
     t <- genTListM g
