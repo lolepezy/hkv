@@ -41,14 +41,6 @@ data Negotiation = Prepared | Rejected | Screwed | Commitable | Commited
   deriving (Eq, Show, Generic, Typeable)
 instance Binary Negotiation
 
-data Thing a where
-  Absent       :: Thing a
-  BadThing     :: SomeException -> Thing a
-  Promise      :: !(IO (Async t)) -> Thing a
-  PreparedDiff :: !(Diff a) -> Thing a
-  Memo         :: !(Val a)  -> Thing a
-
-type Stored v = TVar (Thing v)
 
 
 -- prepareStore :: (Eq k, Hashable k) =>
