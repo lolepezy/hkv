@@ -186,119 +186,57 @@ indexCachedOrIO :: forall pk v i ixs .
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i fromIO =
-    let AtomIdx idxAtoms = getIdxAtom cs i
-    in indexCachedOrIO_ idxAtoms valAtoms store i fromIO
+indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
+  indexCachedOrIO_ idxAtoms valAtoms store i
+  where
+    AtomIdx idxAtoms = getIdxAtom cs i
+    indexCachedOrIO_
+        (Atoms idxAtoms)
+        va@(Atoms valAtoms)
+        store@(IdxSet (Store storeKV) idxs)
+        i fromIO = do
+          x <- join $ atomically $ getByIndex store i >>= \case
+                Just values -> return . return $ Right values
+                Nothing     ->
+                  TM.lookup i idxAtoms >>= \case
+                    Nothing -> do
+                      TM.insert IOIdx i idxAtoms
+                      return $ mask_ $ do
+                        a <- async (fromIO i)
+                        atomically $ TM.insert (PromiseIdx a) i idxAtoms
+                        return $ Left a
+                    Just IOIdx -> retry
+                    Just (PromiseIdx a) -> return $ return $ Left a
+          case x of
+            Left a  -> waitCatch a >>= atomically . updateStore
+            Right v -> return $ Right v
+
+      where
+        updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
+        updateStore ioResult = do
+          atom' <- TM.lookup i idxAtoms
+          case (atom', ioResult) of
+            (Nothing, _) ->
+              -- That means another client has called 'removeAtom'
+              -- so just don't do anything here
+              return ioResult
+            (Just (BrokenIdx e), Left exception) -> do
+              TM.insert (BrokenIdx exception) i idxAtoms
+              return (Left exception)
+            (_, Right values) -> do
+              updateStore values
+              return (Right values)
+
+          where
+            updateStore :: [(pk, Val v)] -> STM ()
+            updateStore values = do
+                insertIntoIdx store i (map fst values)
+                forM_ values (uncurry (resolve store va))
+                TM.delete i idxAtoms
 
 
 getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> ix -> AtomIdx pk v ix
 getIdxAtom CacheStore { idxAtoms = idxAtoms } ik = tlistLookup Proxy (Proxy :: Proxy ik) idxAtoms
-
-
-cachedOrIO_ :: forall pk v ixs .
-              (Eq pk, Hashable pk, Eq v, Hashable v) =>
-              Atoms pk (ValAtom (Val v)) ->
-              GenStore ixs pk (Val v) ->
-              pk ->
-              (pk -> IO (Maybe (Val v))) ->
-              IO (Either SomeException (Maybe (Val v)))
-cachedOrIO_
-  va@(Atoms valAtoms)
-  store@(IdxSet (Store storeKV) idxs)
-  pk fromIO = do
-      x <- join $ atomically $ TM.lookup pk storeKV >>= \case
-            Just x  ->
-              return $ return $ Right (Just x)
-            Nothing     ->
-              TM.lookup pk valAtoms >>= \case
-                Nothing -> do
-                  TM.insert IOVal pk valAtoms
-                  return $ mask_ $ do
-                    a <- async (fromIO pk)
-                    atomically $ TM.insert (PromiseVal a) pk valAtoms
-                    return $ Left a
-                Just IOVal                        -> retry
-                Just (PromiseVal a)               -> return $ return $ Left a
-                Just (PreparedVal (Add _))        -> return $ return $ Right Nothing
-                Just (PreparedVal (Update old _)) -> return $ return $ Right (Just old)
-      case x of
-        Left a  -> waitCatch a >>= atomically . updateStore
-        Right v -> return $ Right v
-  where
-    updateStore :: Either SomeException (Maybe (Val v)) -> STM (Either SomeException (Maybe (Val v)))
-    updateStore ioResult = do
-      atom' <- TM.lookup pk valAtoms
-      case (atom', ioResult) of
-        (Nothing, _) ->
-          -- That means another client has called 'removeAtom'
-          -- so just don't do anything here
-          return ioResult
-        (Just (BrokenVal e), Left exception) -> do
-          TM.insert (BrokenVal exception) pk valAtoms
-          return (Left exception)
-
-        -- TODO Decide what to do in this case
-        (Just _, Left exception) -> do
-          TM.insert (BrokenVal exception) pk valAtoms
-          return (Left exception)
-
-        (_, x@(Right (Just val))) -> do
-          resolve store va pk val
-          TM.delete pk valAtoms
-          return x
-
-
-indexCachedOrIO_ :: forall pk v i idx .
-                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup idx i) =>
-                   Atoms i (IdxAtom (pk, Val v)) ->
-                   Atoms pk (ValAtom (Val v)) ->
-                   GenStore idx pk (Val v) ->
-                   i ->
-                   (i -> IO [(pk, Val v)]) ->
-                   IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO_
-    (Atoms idxAtoms)
-    va@(Atoms valAtoms)
-    store@(IdxSet (Store storeKV) idxs)
-    i fromIO = do
-      x <- join $ atomically $ getByIndex store i >>= \case
-            Just values -> return . return $ Right values
-            Nothing     ->
-              TM.lookup i idxAtoms >>= \case
-                Nothing -> do
-                  TM.insert IOIdx i idxAtoms
-                  return $ mask_ $ do
-                    a <- async (fromIO i)
-                    atomically $ TM.insert (PromiseIdx a) i idxAtoms
-                    return $ Left a
-                Just IOIdx -> retry
-                Just (PromiseIdx a) -> return $ return $ Left a
-      case x of
-        Left a  -> waitCatch a >>= atomically . updateStore
-        Right v -> return $ Right v
-
-  where
-    updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
-    updateStore ioResult = do
-      atom' <- TM.lookup i idxAtoms
-      case (atom', ioResult) of
-        (Nothing, _) ->
-          -- That means another client has called 'removeAtom'
-          -- so just don't do anything here
-          return ioResult
-        (Just (BrokenIdx e), Left exception) -> do
-          TM.insert (BrokenIdx exception) i idxAtoms
-          return (Left exception)
-        (_, Right values) -> do
-          updateStore values
-          return (Right values)
-
-      where
-        updateStore :: [(pk, Val v)] -> STM ()
-        updateStore values = do
-            insertIntoIdx store i (map fst values)
-            forM_ values (uncurry (resolve store va))
-            TM.delete i idxAtoms
 
 
 resolve :: forall pk v ixs .
