@@ -112,13 +112,73 @@ cacheStore indexes = do
   return $ CacheStore (IdxSet store indexes) idxAtoms (Atoms valAtoms)
 
 
-cachedOrIO :: forall pk v ixs .
-               (Eq pk, Hashable pk, Eq v, Hashable v) =>
+cached :: forall pk v ixs . (Eq pk, Hashable pk) =>
+          CacheStore pk (Val v) ixs ->
+          pk ->
+          STM (Maybe (Val v))
+cached CacheStore { store = (IdxSet (Store storeKV) _) } pk = TM.lookup pk storeKV
+
+
+indexCached :: forall pk v i ixs .
+              (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup ixs i)  =>
+              CacheStore pk (Val v) ixs ->
+              i ->
+              STM (Maybe [(pk, Val v)])
+indexCached CacheStore { store = store } = getByIndex store
+
+
+cachedOrIO :: forall pk v ixs . (Eq pk, Hashable pk, Eq v, Hashable v) =>
                CacheStore pk (Val v) ixs ->
                pk ->
                (pk -> IO (Maybe (Val v))) ->
                IO (Either SomeException (Maybe (Val v)))
 cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
+  where
+    cachedOrIO_
+      va@(Atoms valAtoms)
+      store@(IdxSet (Store storeKV) idxs)
+      pk fromIO = do
+          x <- join $ atomically $ TM.lookup pk storeKV >>= \case
+                Just x  ->
+                  return $ return $ Right (Just x)
+                Nothing     ->
+                  TM.lookup pk valAtoms >>= \case
+                    Nothing -> do
+                      TM.insert IOVal pk valAtoms
+                      return $ mask_ $ do
+                        a <- async (fromIO pk)
+                        atomically $ TM.insert (PromiseVal a) pk valAtoms
+                        return $ Left a
+                    Just IOVal                        -> retry
+                    Just (PromiseVal a)               -> return $ return $ Left a
+                    Just (PreparedVal (Add _))        -> return $ return $ Right Nothing
+                    Just (PreparedVal (Update old _)) -> return $ return $ Right (Just old)
+          case x of
+            Left a  -> waitCatch a >>= atomically . updateStore
+            Right v -> return $ Right v
+      where
+        updateStore :: Either SomeException (Maybe (Val v)) -> STM (Either SomeException (Maybe (Val v)))
+        updateStore ioResult = do
+          atom' <- TM.lookup pk valAtoms
+          case (atom', ioResult) of
+            (Nothing, _) ->
+              -- That means another client has called 'removeAtom'
+              -- so just don't do anything here
+              return ioResult
+            (Just (BrokenVal e), Left exception) -> do
+              TM.insert (BrokenVal exception) pk valAtoms
+              return (Left exception)
+
+            -- TODO Decide what to do in this case
+            (Just _, Left exception) -> do
+              TM.insert (BrokenVal exception) pk valAtoms
+              return (Left exception)
+
+            (_, x@(Right (Just val))) -> do
+              resolve store va pk val
+              TM.delete pk valAtoms
+              return x
+
 
 indexCachedOrIO :: forall pk v i ixs .
                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup ixs i)  =>
