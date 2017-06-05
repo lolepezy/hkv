@@ -41,10 +41,17 @@ data Negotiation = Prepared | Rejected | Screwed | Commitable | Commited
   deriving (Eq, Show, Generic, Typeable)
 instance Binary Negotiation
 
+{-
+  Some general ideas:
+    - distributed consensus only applies to individual values and never to indexes
+    - if node1 and node2 has the value for the key 'k' they have to be the same (up to 2-pc semantics)
+    - if a node cached a value for the key 'k' it doesn _not_ mean others have it too
+    - do not try to synchronise values fetched from IO by "cachedOrIO/indexCachedOrIO"
+-}
 
 
 -- prepareStore :: (Eq k, Hashable k) =>
---                 Cache k v -> Key k -> Diff (Val v) -> STM (Maybe (Stored v))
+--                 CacheStore k v -> Key k -> Diff (Val v) -> STM (Maybe (Stored v))
 -- prepareStore (Store kv) k diff = do
 --   val <- TM.lookup k kv
 --   case (val, diff) of

@@ -85,7 +85,10 @@ data ValAtom a where
   PreparedVal :: !(Diff a)          -> ValAtom a
 
 
--- TODO There has to be some periodical job to clean up the broken ones
+{-
+  TODO There has to be some periodical job to clean up the broken ones.
+
+-}
 data IdxAtom a where
   IOIdx      :: IdxAtom a
   PromiseIdx :: !(Async [a])   -> IdxAtom a
