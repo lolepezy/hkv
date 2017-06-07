@@ -184,7 +184,7 @@ cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
 
 
 indexCachedOrIO :: forall pk v i ixs .
-                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, Hashable v, TListLookup ixs i)  =>
+                   (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, TListLookup ixs i)  =>
                    CacheStore pk (Val v) ixs ->
                    i ->
                    (i -> IO [(pk, Val v)]) ->
@@ -243,7 +243,7 @@ getIdxAtom CacheStore { idxAtoms = idxAtoms } ik = tlistLookup Proxy (Proxy :: P
 
 
 resolve :: forall pk v ixs .
-           (Eq pk, Hashable pk, Eq v, Hashable v) =>
+           (Eq pk, Hashable pk) =>
            GenStore ixs pk (Val v) ->
            Atoms pk (ValAtom (Val v)) ->
            pk ->
