@@ -84,11 +84,6 @@ data ValAtom a where
   PromiseVal  :: !(Async (Maybe a)) -> ValAtom a
   PreparedVal :: !(Diff a)          -> ValAtom a
 
-
-{-
-  TODO There has to be some periodical job to clean up the broken ones.
-
--}
 data IdxAtom a where
   IOIdx      :: IdxAtom a
   PromiseIdx :: !(Async [a])   -> IdxAtom a
@@ -99,12 +94,16 @@ newtype Atoms k a = Atoms (StoreMap k a)
 
 newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, v)))
 
+data ErrorCaching = NoErrorCaching | TimedCaching Int
+
 data CacheStore pk v ixs = CacheStore {
   store    :: GenStore ixs pk v,
   idxAtoms :: TList ixs (AtomIdx pk v),
   valAtoms :: Atoms pk (ValAtom v)
 }
 
+-- Auxiliary internal type
+data AtomS p e v = Promise_ p | Broken_ e | Value_ v
 
 cacheStore :: (Eq pk, Hashable pk, TListGen ixs (AtomIdx pk v)) =>
               TList ixs (GenIdx pk v) -> STM (CacheStore pk v ixs)
@@ -143,7 +142,7 @@ cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
       pk fromIO = do
           x <- join $ atomically $ TM.lookup pk storeKV >>= \case
                 Just x  ->
-                  return $ return $ Right (Just x)
+                  return $ return $ Value_ (Just x)
                 Nothing     ->
                   TM.lookup pk valAtoms >>= \case
                     Nothing -> do
@@ -151,14 +150,16 @@ cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
                       return $ mask_ $ do
                         a <- async (fromIO pk)
                         atomically $ TM.insert (PromiseVal a) pk valAtoms
-                        return $ Left a
+                        return $ Promise_ a
                     Just IOVal                        -> retry
-                    Just (PromiseVal a)               -> return $ return $ Left a
-                    Just (PreparedVal (Add _))        -> return $ return $ Right Nothing
-                    Just (PreparedVal (Update old _)) -> return $ return $ Right (Just old)
+                    Just (PromiseVal a)               -> return $ return $ Promise_ a
+                    Just (PreparedVal (Add _))        -> return $ return $ Value_ Nothing
+                    Just (PreparedVal (Update old _)) -> return $ return $ Value_ (Just old)
           case x of
-            Left a  -> waitCatch a >>= atomically . updateStore
-            Right v -> return $ Right v
+            Value_ v   -> return $ Right v
+            Promise_ a -> waitCatch a >>= atomically . updateStore
+            Broken_ e  -> return $ Left e
+
       where
         updateStore :: Either SomeException (Maybe (Val v)) -> STM (Either SomeException (Maybe (Val v)))
         updateStore ioResult = do
@@ -199,7 +200,7 @@ indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
         store@(IdxSet (Store storeKV) idxs)
         i fromIO = do
           x <- join $ atomically $ getByIndex store i >>= \case
-                Just values -> return . return $ Right values
+                Just values -> return . return $ Value_ values
                 Nothing     ->
                   TM.lookup i idxAtoms >>= \case
                     Nothing -> do
@@ -207,12 +208,14 @@ indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
                       return $ mask_ $ do
                         a <- async (fromIO i)
                         atomically $ TM.insert (PromiseIdx a) i idxAtoms
-                        return $ Left a
+                        return $ Promise_ a
                     Just IOIdx -> retry
-                    Just (PromiseIdx a) -> return $ return $ Left a
+                    Just (PromiseIdx a) -> return $ return $ Promise_ a
+                    Just (BrokenIdx e)  -> return $ return $ Broken_ e
           case x of
-            Left a  -> waitCatch a >>= atomically . updateStore
-            Right v -> return $ Right v
+            Value_ v   -> return $ Right v
+            Promise_ a -> waitCatch a >>= atomically . updateStore
+            Broken_ e  -> return $ Left e
 
       where
         updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
@@ -226,13 +229,18 @@ indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
             (Just (BrokenIdx e), Left exception) -> do
               TM.insert (BrokenIdx exception) i idxAtoms
               return (Left exception)
+
+            (Just _, Left exception) -> do
+              TM.insert (BrokenIdx exception) i idxAtoms
+              return (Left exception)
+
             (_, Right values) -> do
-              updateStore values
+              updateValues values
               return (Right values)
 
           where
-            updateStore :: [(pk, Val v)] -> STM ()
-            updateStore values = do
+            updateValues :: [(pk, Val v)] -> STM ()
+            updateValues values = do
                 insertIntoIdx store i (map fst values)
                 forM_ values (uncurry (resolve store va))
                 TM.delete i idxAtoms
