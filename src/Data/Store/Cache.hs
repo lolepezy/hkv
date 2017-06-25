@@ -15,6 +15,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE RecordWildCards #-}
 module Data.Store.Cache where
 
 import Control.Exception
@@ -28,6 +29,8 @@ import Data.Binary
 import Data.Hashable
 import Data.Typeable
 import GHC.Generics (Generic)
+
+import Data.Time.Clock
 
 import Debug.Trace
 
@@ -80,9 +83,9 @@ instance Binary a => Binary (Diff a)
 
 data ValAtom a where
   IOVal       :: ValAtom a
-  BrokenVal   :: !SomeException     -> ValAtom a
-  PromiseVal  :: !(Async (Maybe a)) -> ValAtom a
-  PreparedVal :: !(Diff a)          -> ValAtom a
+  BrokenVal   :: SomeException -> UTCTime -> ValAtom a
+  PromiseVal  :: !(Async (Maybe a))            -> ValAtom a
+  PreparedVal :: !(Diff a)                     -> ValAtom a
 
 data IdxAtom a where
   IOIdx      :: IdxAtom a
@@ -96,14 +99,23 @@ newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, v)))
 
 data ErrorCaching = NoErrorCaching | TimedCaching Int
 
+data ErrorCachingS e a args = ErrorCachingS {
+  broken    :: SomeException -> args -> Maybe e,
+  requested :: SomeException -> ValAtom a
+}
+
 data CacheStore pk v ixs = CacheStore {
-  store    :: GenStore ixs pk v,
-  idxAtoms :: TList ixs (AtomIdx pk v),
-  valAtoms :: Atoms pk (ValAtom v)
+  store        :: GenStore ixs pk v,
+  idxAtoms     :: TList ixs (AtomIdx pk v),
+  valAtoms     :: Atoms pk (ValAtom v),
+  errorCaching :: ErrorCaching
 }
 
 -- Auxiliary internal type
 data AtomS p e v = Promise_ p | Broken_ e | Value_ v
+
+-- TODO Use this one instead of Maybe
+data ResulVal a = Absent | BeingPrepared | Present (Val a)
 
 cacheStore :: (Eq pk, Hashable pk, TListGen ixs (AtomIdx pk v)) =>
               TList ixs (GenIdx pk v) -> STM (CacheStore pk v ixs)
@@ -111,7 +123,8 @@ cacheStore indexes = do
   store <- mkStore
   valAtoms <- TM.new
   idxAtoms <- genTListM (AtomIdx . Atoms <$> TM.new)
-  return $ CacheStore (IdxSet store indexes) idxAtoms (Atoms valAtoms)
+  return $ CacheStore (IdxSet store indexes)
+                      idxAtoms (Atoms valAtoms) NoErrorCaching
 
 
 cached :: forall pk v ixs . (Eq pk, Hashable pk) =>
@@ -134,7 +147,7 @@ cachedOrIO :: forall pk v ixs . (Eq pk, Hashable pk, Eq v, Hashable v) =>
                pk ->
                (pk -> IO (Maybe (Val v))) ->
                IO (Either SomeException (Maybe (Val v)))
-cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
+cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
   where
     cachedOrIO_
       va@(Atoms valAtoms)
@@ -143,7 +156,7 @@ cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
           x <- join $ atomically $ TM.lookup pk storeKV >>= \case
                 Just x  ->
                   return $ return $ Value_ (Just x)
-                Nothing     ->
+                Nothing ->
                   TM.lookup pk valAtoms >>= \case
                     Nothing -> do
                       TM.insert IOVal pk valAtoms
@@ -153,35 +166,55 @@ cachedOrIO CacheStore { store = store, valAtoms = va } = cachedOrIO_ va store
                         return $ Promise_ a
                     Just IOVal                        -> retry
                     Just (PromiseVal a)               -> return $ return $ Promise_ a
+                    Just (BrokenVal e c)              -> return $ return $ Broken_ (e, c)
+
+                    {- TODO Replace Maybe with a type with 3 values:
+                      Absent | BeingPrepared | Present (Val a)
+                      to distinguish betweet "no value" situation and
+                      "wait a second, it's being prepared in 2-PC"
+                    -}
                     Just (PreparedVal (Add _))        -> return $ return $ Value_ Nothing
+
                     Just (PreparedVal (Update old _)) -> return $ return $ Value_ (Just old)
           case x of
-            Value_ v   -> return $ Right v
-            Promise_ a -> waitCatch a >>= atomically . updateStore
-            Broken_ e  -> return $ Left e
+            Value_ v        -> return $ Right v
+            Promise_ a      -> waitAndUpdateStore a
+            Broken_ (e, c)  ->
+              case (errorCaching, c) of
+                (NoErrorCaching, _)  -> return $ Left e
+                (TimedCaching t, et) -> do
+                  ct <- getCurrentTime
+                  -- when (ct < et + 1000) $ return ()
+                  return $ Left e
 
       where
-        updateStore :: Either SomeException (Maybe (Val v)) -> STM (Either SomeException (Maybe (Val v)))
-        updateStore ioResult = do
-          atom' <- TM.lookup pk valAtoms
-          case (atom', ioResult) of
-            (Nothing, _) ->
-              -- That means another client has called 'removeAtom'
-              -- so just don't do anything here
-              return ioResult
-            (Just (BrokenVal e), Left exception) -> do
-              TM.insert (BrokenVal exception) pk valAtoms
-              return (Left exception)
+        waitAndUpdateStore :: Async (Maybe (Val v)) -> IO (Either SomeException (Maybe (Val v)))
+        waitAndUpdateStore a = do
+          r <- waitCatch a
+          case (r, errorCaching) of
+            (Right v, _) -> do
+                atomically $ do
+                  forM_ v (resolve store va pk)
+                  TM.delete pk valAtoms
+                return (Right v)
 
-            -- TODO Decide what to do in this case
-            (Just _, Left exception) -> do
-              TM.insert (BrokenVal exception) pk valAtoms
-              return (Left exception)
+            (Left e, NoErrorCaching) -> return (Left e)
 
-            (_, x@(Right (Just val))) -> do
-              resolve store va pk val
-              TM.delete pk valAtoms
-              return x
+            (Left e, TimedCaching _) -> do
+              {- TODO getCurrentTime is pretty slow and to avoid multiple calls
+                 we could move it inside of the async (fromIO pk) computation
+              -}
+              time <- getCurrentTime
+              atomically $ TM.lookup pk valAtoms >>= \case
+                  -- it is the only valid case
+                  Just (BrokenVal e _) -> TM.insert (BrokenVal e time) pk valAtoms
+
+                  _ ->
+                    -- TODO That must not happen ever, add some assertion here
+                    return ()
+
+              return (Left e)
+
 
 
 indexCachedOrIO :: forall pk v i ixs .
@@ -267,8 +300,8 @@ resolve
             Just (Val v' version') ->
                 when (version > version') insertToStore
         Just a  -> case a of
-          PromiseVal _ -> insertToStore
-          BrokenVal e  -> insertToStore
+          PromiseVal _  -> insertToStore
+          BrokenVal _ _ -> insertToStore
           PreparedVal _ -> return ()
     where
       insertToStore = TM.insert val pk storeKV
