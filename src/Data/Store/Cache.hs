@@ -84,8 +84,8 @@ instance Binary a => Binary (Diff a)
 data ValAtom a where
   IOVal       :: ValAtom a
   BrokenVal   :: SomeException -> UTCTime -> ValAtom a
-  PromiseVal  :: !(Async (Maybe a))            -> ValAtom a
-  PreparedVal :: !(Diff a)                     -> ValAtom a
+  PromiseVal  :: !(Async (Maybe a))       -> ValAtom a
+  PreparedVal :: !(Diff a)                -> ValAtom a
 
 data IdxAtom a where
   IOIdx      :: IdxAtom a
@@ -98,11 +98,6 @@ newtype Atoms k a = Atoms (StoreMap k a)
 newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, v)))
 
 data ErrorCaching = NoErrorCaching | TimedCaching Int
-
-data ErrorCachingS e a args = ErrorCachingS {
-  broken    :: SomeException -> args -> Maybe e,
-  requested :: SomeException -> ValAtom a
-}
 
 data CacheStore pk v ixs = CacheStore {
   store        :: GenStore ixs pk v,
@@ -158,15 +153,10 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
                   return $ return $ Value_ (Just x)
                 Nothing ->
                   TM.lookup pk valAtoms >>= \case
-                    Nothing -> do
-                      TM.insert IOVal pk valAtoms
-                      return $ mask_ $ do
-                        a <- async (fromIO pk)
-                        atomically $ TM.insert (PromiseVal a) pk valAtoms
-                        return $ Promise_ a
+                    Nothing                           -> startAsync >>= \a -> return (Promise_ <$> a)
                     Just IOVal                        -> retry
                     Just (PromiseVal a)               -> return $ return $ Promise_ a
-                    Just (BrokenVal e c)              -> return $ return $ Broken_ (e, c)
+                    Just (BrokenVal e t)              -> return $ return $ Broken_ (e, t)
 
                     {- TODO Replace Maybe with a type with 3 values:
                       Absent | BeingPrepared | Present (Val a)
@@ -179,15 +169,24 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
           case x of
             Value_ v        -> return $ Right v
             Promise_ a      -> waitAndUpdateStore a
-            Broken_ (e, c)  ->
-              case (errorCaching, c) of
-                (NoErrorCaching, _)  -> return $ Left e
-                (TimedCaching t, et) -> do
+            Broken_ (e, t)  ->
+              case errorCaching of
+                NoErrorCaching      -> return $ Left e
+                TimedCaching period -> do
                   ct <- getCurrentTime
-                  -- when (ct < et + 1000) $ return ()
-                  return $ Left e
+                  if longEnough period t ct
+                    then join (atomically startAsync) >>= waitAndUpdateStore
+                    else return $ Left e
 
       where
+        startAsync :: STM (IO (Async (Maybe (Val v))))
+        startAsync = do
+          TM.insert IOVal pk valAtoms
+          return $ mask_ $ do
+            a <- async (fromIO pk)
+            atomically $ TM.insert (PromiseVal a) pk valAtoms
+            return a
+
         waitAndUpdateStore :: Async (Maybe (Val v)) -> IO (Either SomeException (Maybe (Val v)))
         waitAndUpdateStore a = do
           r <- waitCatch a
@@ -198,7 +197,7 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
                   TM.delete pk valAtoms
                 return (Right v)
 
-            (Left e, NoErrorCaching) -> return (Left e)
+            (Left e, NoErrorCaching) -> return $ Left e
 
             (Left e, TimedCaching _) -> do
               {- TODO getCurrentTime is pretty slow and to avoid multiple calls
@@ -215,6 +214,8 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
 
               return (Left e)
 
+        longEnough :: Int -> UTCTime -> UTCTime -> Bool
+        longEnough period utc1 utc2 = diffUTCTime utc1 utc2 < (fromInteger (toInteger period) :: NominalDiffTime)
 
 
 indexCachedOrIO :: forall pk v i ixs .
