@@ -31,8 +31,11 @@ import Data.Typeable
 
 import qualified ListT as LT
 
-import Test.QuickCheck (arbitrary, Property, Arbitrary, quickCheck, choose, sized, vectorOf, sublistOf)
-import Test.QuickCheck.Monadic (PropertyM, assert, monadicIO, pick, pre, run)
+import Test.Tasty
+import Test.Tasty.QuickCheck as QC
+import qualified Test.Tasty.HUnit as HU
+
+import Test.QuickCheck.Monadic
 
 import Data.Store.KV
 import qualified Data.Store.Cache as Cache
@@ -40,7 +43,7 @@ import qualified Data.Store.Cache as Cache
 newtype IKey = IKey Int deriving (Eq, Ord, Show, Generic)
 instance Hashable IKey
 
-instance Arbitrary IKey where
+instance QC.Arbitrary IKey where
   arbitrary = IKey <$> arbitrary
 
 type Entry = (IKey, String, Bool)
@@ -85,7 +88,7 @@ inc pk counters = do
   modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
 
 uniqueEntries :: Monad m => PropertyM m [Entry]
-uniqueEntries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) <$> pick arbitrary
+uniqueEntries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) <$> pick QC.arbitrary
 
 atomsAreEmpty :: Cache.CacheStore IKey (Cache.Val Entry) EntryIdxs -> STM (Bool, Bool, Bool)
 atomsAreEmpty store = do
@@ -95,7 +98,7 @@ atomsAreEmpty store = do
   (,,) <$> TM.null bIdx <*> TM.null sIdx <*> TM.null valAtoms
 
 
-prop_cache_or_io_should_invoke_io_exactly_once :: Property
+prop_cache_or_io_should_invoke_io_exactly_once :: QC.Property
 prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   entries <- uniqueEntries
   store <- run mkTestStore
@@ -125,7 +128,7 @@ prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   assert ve
 
 
-prop_idx_cache_or_io_should_invoke_io_exactly_once :: Property
+prop_idx_cache_or_io_should_invoke_io_exactly_once :: QC.Property
 prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   entries <- uniqueEntries
 
@@ -156,32 +159,42 @@ data SomeIOProblem = SomeIOProblem deriving (Show, Typeable)
 
 instance Exception SomeIOProblem
 
-prop_cache_or_io_should_cache_errors_and_then_remove_them :: Property
-prop_cache_or_io_should_cache_errors_and_then_remove_them = monadicIO $ do
-  e :: Entry <- pick arbitrary
+cache_or_io_much_not_cache_errors_by_default :: HU.Assertion
+cache_or_io_much_not_cache_errors_by_default = do
+  let e = (IKey 1, "1", False)
   let pk = primaryKey e
 
-  store <- run mkTestStore
-  counters <- run $ atomically (mkCounters [pk])
-  c <- run $ atomically $ newTVar (Counter 0)
+  store <- mkTestStore
+  counters <- atomically (mkCounters [pk])
+  c <- atomically $ newTVar (Counter 0)
 
   let ioWithError pk = do
         atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
         throw SomeIOProblem
 
-  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- run $ Cache.cachedOrIO store pk ioWithError
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- run $ Cache.cachedOrIO store pk ioWithError
+  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk ioWithError
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk ioWithError
 
-  Counter n <- run $ readTVarIO c
-  (be, se, ve) <- run $ atomically $ atomsAreEmpty store
-  assert be
-  assert se
-  assert ve
-  assert $ n == 2
+  Counter n <- readTVarIO c
+  (be, se, ve) <- atomically $ atomsAreEmpty store
+  HU.assert be
+  HU.assert se
+  HU.assert ve
+  HU.assert $ n == 2
+
+
+qcProps = testGroup "(checked by QuickCheck)"
+  [ QC.testProperty "IO should happen exactly once" prop_cache_or_io_should_invoke_io_exactly_once
+  , QC.testProperty "IO should happen exactly once for IDX queries" prop_idx_cache_or_io_should_invoke_io_exactly_once
+  ]
+
+unitTests = testGroup "Unit tests"
+  [ HU.testCase "Fermat's last theorem" cache_or_io_much_not_cache_errors_by_default
+  ]
 
 
 main :: IO ()
-main = do
-  quickCheck prop_cache_or_io_should_invoke_io_exactly_once
-  quickCheck prop_idx_cache_or_io_should_invoke_io_exactly_once
-  quickCheck prop_cache_or_io_should_cache_errors_and_then_remove_them
+main = defaultMain $ testGroup "Tests" [qcProps, unitTests]
+
+tests :: TestTree
+tests = testGroup "Tests" [qcProps, unitTests]
