@@ -21,10 +21,13 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Monad (forM_, forM)
 
+import Control.Exception hiding (assert)
+
 import Data.Hashable
 import Data.List
 import Data.Maybe (listToMaybe)
 import GHC.Generics (Generic)
+import Data.Typeable
 
 import qualified ListT as LT
 
@@ -89,16 +92,12 @@ atomsAreEmpty store = do
   let (Cache.Atoms valAtoms) = Cache.valAtoms store
   let (Cache.AtomIdx (Cache.Atoms sIdx)) = Cache.getIdxAtom store ("" :: String)
   let (Cache.AtomIdx (Cache.Atoms bIdx)) = Cache.getIdxAtom store (True :: Bool)
-  be <- TM.null bIdx
-  se <- TM.null sIdx
-  ve <- TM.null valAtoms
-  return (be, se, ve)
+  (,,) <$> TM.null bIdx <*> TM.null sIdx <*> TM.null valAtoms
 
 
 prop_cache_or_io_should_invoke_io_exactly_once :: Property
 prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   entries <- uniqueEntries
-
   store <- run mkTestStore
 
   requestPks <- requestPks $ map primaryKey entries
@@ -153,8 +152,36 @@ prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   assert ve
 
 
+data SomeIOProblem = SomeIOProblem deriving (Show, Typeable)
+
+instance Exception SomeIOProblem
+
+prop_cache_or_io_should_cache_errors_and_then_remove_them :: Property
+prop_cache_or_io_should_cache_errors_and_then_remove_them = monadicIO $ do
+  e :: Entry <- pick arbitrary
+  let pk = primaryKey e
+
+  store <- run mkTestStore
+  counters <- run $ atomically (mkCounters [pk])
+  c <- run $ atomically $ newTVar (Counter 0)
+
+  let ioWithError pk = do
+        atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
+        throw SomeIOProblem
+
+  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- run $ Cache.cachedOrIO store pk ioWithError
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- run $ Cache.cachedOrIO store pk ioWithError
+
+  Counter n <- run $ readTVarIO c
+  (be, se, ve) <- run $ atomically $ atomsAreEmpty store
+  assert be
+  assert se
+  assert ve
+  assert $ n == 2
+
 
 main :: IO ()
 main = do
   quickCheck prop_cache_or_io_should_invoke_io_exactly_once
   quickCheck prop_idx_cache_or_io_should_invoke_io_exactly_once
+  quickCheck prop_cache_or_io_should_cache_errors_and_then_remove_them
