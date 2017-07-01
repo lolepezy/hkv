@@ -197,7 +197,9 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
                   TM.delete pk valAtoms
                 return (Right v)
 
-            (Left e, NoErrorCaching) -> return $ Left e
+            (Left e, NoErrorCaching) -> do
+              atomically $ TM.delete pk valAtoms
+              return $ Left e
 
             (Left e, TimedCaching _) -> do
               {- TODO getCurrentTime is pretty slow and to avoid multiple calls
