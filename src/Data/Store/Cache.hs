@@ -112,14 +112,26 @@ data AtomS p e v = Promise_ p | Broken_ e | Value_ v
 -- TODO Use this one instead of Maybe
 data ResulVal a = Absent | BeingPrepared | Present (Val a)
 
+
+data CacheConf = CacheConf {
+  errorCachingStrategy :: ErrorCaching
+}
+
+defaultCacheConf :: CacheConf
+defaultCacheConf = CacheConf NoErrorCaching
+
 cacheStore :: (Eq pk, Hashable pk, TListGen ixs (AtomIdx pk v)) =>
               TList ixs (GenIdx pk v) -> STM (CacheStore pk v ixs)
-cacheStore indexes = do
+cacheStore indexes = cacheStoreWithConf indexes defaultCacheConf
+
+cacheStoreWithConf :: (Eq pk, Hashable pk, TListGen ixs (AtomIdx pk v)) =>
+              TList ixs (GenIdx pk v) -> CacheConf -> STM (CacheStore pk v ixs)
+cacheStoreWithConf indexes CacheConf {..} = do
   store <- mkStore
   valAtoms <- TM.new
   idxAtoms <- genTListM (AtomIdx . Atoms <$> TM.new)
   return $ CacheStore (IdxSet store indexes)
-                      idxAtoms (Atoms valAtoms) NoErrorCaching
+                      idxAtoms (Atoms valAtoms) errorCachingStrategy
 
 
 cached :: forall pk v ixs . (Eq pk, Hashable pk) =>

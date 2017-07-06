@@ -43,7 +43,7 @@ import qualified Data.Store.Cache as Cache
 newtype IKey = IKey Int deriving (Eq, Ord, Show, Generic)
 instance Hashable IKey
 
-instance QC.Arbitrary IKey where
+instance Arbitrary IKey where
   arbitrary = IKey <$> arbitrary
 
 type Entry = (IKey, String, Bool)
@@ -159,6 +159,11 @@ data SomeIOProblem = SomeIOProblem deriving (Show, Typeable)
 
 instance Exception SomeIOProblem
 
+ioWithError :: TVar Counter -> IKey -> IO (Maybe (Cache.Val Entry))
+ioWithError c pk = do
+    atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
+    throw SomeIOProblem
+
 cache_or_io_much_not_cache_errors_by_default :: HU.Assertion
 cache_or_io_much_not_cache_errors_by_default = do
   let e = (IKey 1, "1", False)
@@ -168,22 +173,39 @@ cache_or_io_much_not_cache_errors_by_default = do
   counters <- atomically (mkCounters [pk])
   c <- atomically $ newTVar (Counter 0)
 
-  let ioWithError pk = do
-        atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
-        throw SomeIOProblem
-
-  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk ioWithError
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk ioWithError
+  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
 
   Counter n <- readTVarIO c
+  HU.assert $ n == 2
   (be, se, ve) <- atomically $ atomsAreEmpty store
   HU.assert be
   HU.assert se
   HU.assert ve
+
+
+cache_or_io_must_cache_errors_for_period_of_time :: HU.Assertion
+cache_or_io_must_cache_errors_for_period_of_time = do
+  let e = (IKey 1, "1", False)
+  let pk = primaryKey e
+
+  store <- mkTestStore
+  counters <- atomically (mkCounters [pk])
+  c <- atomically $ newTVar (Counter 0)
+
+  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
+
+  Counter n <- readTVarIO c
   HU.assert $ n == 2
+  (be, se, ve) <- atomically $ atomsAreEmpty store
+  HU.assert be
+  HU.assert se
+  HU.assert ve
 
 
-qcProps = testGroup "(checked by QuickCheck)"
+
+qcProps = testGroup "Cache properties"
   [ QC.testProperty "IO should happen exactly once" prop_cache_or_io_should_invoke_io_exactly_once
   , QC.testProperty "IO should happen exactly once for IDX queries" prop_idx_cache_or_io_should_invoke_io_exactly_once
   ]
