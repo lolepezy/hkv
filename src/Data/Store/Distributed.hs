@@ -14,7 +14,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UnicodeSyntax #-}
+{-# LANGUAGE RecordWildCards #-}
 module Data.Store.Distributed where
 
 import Control.Exception
@@ -50,26 +50,32 @@ instance Binary Negotiation
 -}
 
 
--- prepareStore :: (Eq k, Hashable k) =>
---                 CacheStore k v -> Key k -> Diff (Val v) -> STM (Maybe (Stored v))
--- prepareStore (Store kv) k diff = do
---   val <- TM.lookup k kv
---   case (val, diff) of
---     (Nothing, Add val) -> do
---       t <- newTVar (PreparedDiff diff)
---       TM.insert t k kv
---       return (Just t)
+-- prepareStore :: forall pk v ixs . (Eq pk, Hashable pk) =>
+--                 CacheStore pk (Val v) ixs ->
+--                 pk ->
+--                 Diff (Val v) -> STM (Maybe (Val v))
+-- prepareStore CacheStore {..} k diff = do
+--   prepareStore_ valAtoms store
+--   where
+--     prepareStore_
+--       va@(Atoms valAtoms)
+--       store@(IdxSet (Store storeKV) idxs) = do
+--         val <- TM.lookup k kv
+--         case (val, diff) of
+--           (Nothing, Add val) -> do
+--             t <- newTVar (PreparedDiff diff)
+--             TM.insert t k kv
+--             return (Just t)
 --
---     (Just thing, Update _ (Val _ v)) -> readTVar thing >>= \case
---         Memo (Val _ v') | v == v' -> do
---           writeTVar thing (PreparedDiff diff)
---           return (Just thing)
+--           (Just thing, Update _ (Val _ v)) -> readTVar thing >>= \case
+--               Memo (Val _ v') | v == v' -> do
+--                 writeTVar thing (PreparedDiff diff)
+--                 return (Just thing)
 --
---         _ -> return Nothing
+--               _ -> return Nothing
 --
---     _ -> return Nothing
---
---
+--           _ -> return Nothing
+
 -- commitThing :: TVar (Thing v) -> IO Negotiation
 -- commitThing thing = atomically $ readTVar thing >>= \case
 --   (PreparedDiff (Add v))      -> writeTVar thing (Memo v) >> return Commited
