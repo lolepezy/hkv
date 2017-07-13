@@ -97,7 +97,7 @@ newtype Atoms k a = Atoms (StoreMap k a)
 
 newtype AtomIdx pk v ix = AtomIdx (Atoms ix (IdxAtom (pk, v)))
 
-data ErrorCaching = NoErrorCaching | TimedCaching Int
+data ErrorCaching = NoErrorCaching | TimedCaching NominalDiffTime
 
 data CacheStore pk v ixs = CacheStore {
   store        :: GenStore ixs pk v,
@@ -186,7 +186,7 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
                 NoErrorCaching      -> return $ Left e
                 TimedCaching period -> do
                   ct <- getCurrentTime
-                  if longEnough period t ct
+                  if longEnough period ct t
                     then join (atomically startAsync) >>= waitAndUpdateStore
                     else return $ Left e
 
@@ -218,18 +218,12 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
                  we could move it inside of the async (fromIO pk) computation
               -}
               time <- getCurrentTime
-              atomically $ TM.lookup pk valAtoms >>= \case
-                  -- it is the only valid case
-                  Just (BrokenVal e _) -> TM.insert (BrokenVal e time) pk valAtoms
-
-                  _ ->
-                    -- TODO That must not happen ever, add some assertion here
-                    return ()
-
+              -- TODO Add some check here to know what exactly are we replacing
+              atomically $ TM.insert (BrokenVal e time) pk valAtoms
               return (Left e)
 
-        longEnough :: Int -> UTCTime -> UTCTime -> Bool
-        longEnough period utc1 utc2 = diffUTCTime utc1 utc2 < (fromInteger (toInteger period) :: NominalDiffTime)
+        longEnough :: NominalDiffTime -> UTCTime -> UTCTime -> Bool
+        longEnough period utc1 utc2 = diffUTCTime utc1 utc2 > period
 
 
 indexCachedOrIO :: forall pk v i ixs .

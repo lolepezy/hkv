@@ -17,6 +17,7 @@
 import qualified STMContainers.Set as TS
 import qualified STMContainers.Map as TM
 
+import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Monad (forM_, forM)
@@ -53,10 +54,12 @@ type Store_ = GenStore EntryIdxs IKey Entry
 
 newtype Counter = Counter Int deriving (Eq, Ord, Show, Generic)
 
-mkTestStore = atomically $ do
+mkTestStoreWithConf conf = atomically $ do
     sIdx <- idxFun (\(Cache.Val (_, s, _) _) -> s)
     bIdx <- idxFun (\(Cache.Val (_, _, b) _) -> b)
-    Cache.cacheStore (sIdx :-: bIdx :-: TNil)
+    Cache.cacheStoreWithConf (sIdx :-: bIdx :-: TNil) conf
+
+mkTestStore = mkTestStoreWithConf Cache.defaultCacheConf
 
 primaryKey :: Entry -> IKey
 primaryKey (pk, _, _) = pk
@@ -164,6 +167,11 @@ ioWithError c pk = do
     atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
     throw SomeIOProblem
 
+ioWithSuccess :: TVar Counter -> IKey -> IO (Maybe (Cache.Val Entry))
+ioWithSuccess c pk = do
+    atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
+    return $ Just $ Cache.Val (pk, "whatever", True) (Cache.Version 1)
+
 cache_or_io_much_not_cache_errors_by_default :: HU.Assertion
 cache_or_io_much_not_cache_errors_by_default = do
   let e = (IKey 1, "1", False)
@@ -174,7 +182,7 @@ cache_or_io_much_not_cache_errors_by_default = do
   c <- atomically $ newTVar (Counter 0)
 
   r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
 
   Counter n <- readTVarIO c
   HU.assert $ n == 2
@@ -182,36 +190,48 @@ cache_or_io_much_not_cache_errors_by_default = do
   HU.assert be
   HU.assert se
   HU.assert ve
-
 
 cache_or_io_must_cache_errors_for_period_of_time :: HU.Assertion
 cache_or_io_must_cache_errors_for_period_of_time = do
   let e = (IKey 1, "1", False)
   let pk = primaryKey e
 
-  store <- mkTestStore
+  store <- mkTestStoreWithConf (Cache.CacheConf (Cache.TimedCaching 0.1))
   counters <- atomically (mkCounters [pk])
   c <- atomically $ newTVar (Counter 0)
 
   r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
 
   Counter n <- readTVarIO c
-  HU.assert $ n == 2
+  HU.assert $ n == 1
   (be, se, ve) <- atomically $ atomsAreEmpty store
+  HU.assert True
   HU.assert be
   HU.assert se
-  HU.assert ve
+  HU.assert (not ve)
 
+  threadDelay (150*1000 :: Int)
+
+  r3 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
+  Counter n <- readTVarIO c
+  HU.assert $ n == 2
+  (be1, se1, ve1) <- atomically $ atomsAreEmpty store
+  HU.assert be1
+  HU.assert se1
+  HU.assert ve1
 
 
 qcProps = testGroup "Cache properties"
-  [ QC.testProperty "IO should happen exactly once" prop_cache_or_io_should_invoke_io_exactly_once
+  [
+    QC.testProperty "IO should happen exactly once" prop_cache_or_io_should_invoke_io_exactly_once
   , QC.testProperty "IO should happen exactly once for IDX queries" prop_idx_cache_or_io_should_invoke_io_exactly_once
   ]
 
 unitTests = testGroup "Unit tests"
-  [ HU.testCase "Fermat's last theorem" cache_or_io_much_not_cache_errors_by_default
+  [
+    HU.testCase "Don't cache error by default" cache_or_io_much_not_cache_errors_by_default,
+    HU.testCase "Cache errors for 0.5 second" cache_or_io_must_cache_errors_for_period_of_time
   ]
 
 
