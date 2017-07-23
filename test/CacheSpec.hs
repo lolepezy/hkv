@@ -206,7 +206,6 @@ cache_or_io_must_cache_errors_for_period_of_time = do
   Counter n <- readTVarIO c
   HU.assert $ n == 1
   (be, se, ve) <- atomically $ atomsAreEmpty store
-  HU.assert True
   HU.assert be
   HU.assert se
   HU.assert (not ve)
