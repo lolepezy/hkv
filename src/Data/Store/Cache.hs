@@ -82,16 +82,17 @@ instance Binary a => Binary (Diff a)
 -}
 
 data ValAtom a where
-  RetryIO     :: ValAtom a
-  DoIO        :: ValAtom a
-  BrokenVal   :: SomeException -> UTCTime -> ValAtom a
-  PromiseVal  :: !(Async (Maybe a))       -> ValAtom a
-  PreparedVal :: !(Diff a)                -> ValAtom a
+  RetryingIO   :: ValAtom a
+  PerformingIO :: ValAtom a
+  PromiseVal   :: !(Async (Maybe a))         -> ValAtom a
+  PreparedVal  :: !(Diff a)                  -> ValAtom a
+  BrokenVal    :: !SomeException -> !UTCTime -> ValAtom a
 
 data IdxAtom a where
-  IOIdx      :: IdxAtom a
-  PromiseIdx :: !(Async [a])   -> IdxAtom a
-  BrokenIdx  :: !SomeException -> IdxAtom a
+  IOIdx         :: IdxAtom a
+  RetryingIOIdx :: IdxAtom a
+  PromiseIdx    :: !(Async [a])   -> IdxAtom a
+  BrokenIdx     :: !SomeException -> !UTCTime -> IdxAtom a
 
 
 newtype Atoms k a = Atoms (StoreMap k a)
@@ -107,11 +108,16 @@ data CacheStore pk v ixs = CacheStore {
   errorCaching :: ErrorCaching
 }
 
--- Auxiliary internal type
 data AtomS p e v = Promise_ p | Broken_ e | Value_ v
 
--- TODO Use this one instead of Maybe
-data ResultVal a = Absent | BeingPrepared | Present (Val a)
+data ResultVal a = NoVal | Unknown | Exists a
+
+type CachedVal a = Either SomeException (ResultVal (Val a))
+
+
+toResultVal :: Maybe a -> ResultVal a
+toResultVal Nothing = NoVal
+toResultVal (Just v) = Exists v
 
 data CacheConf = CacheConf {
   errorCachingStrategy :: ErrorCaching
@@ -150,12 +156,14 @@ indexCached CacheStore { store = store } = getByIndex store
 
 {-
   TODO Add some logic to leep track of IO actions that take too long to execute.
+
+
 -}
 cachedOrIO :: forall pk v ixs . (Eq pk, Hashable pk, Eq v, Hashable v, Show v) =>
                CacheStore pk (Val v) ixs ->
                pk ->
                (pk -> IO (Maybe (Val v))) ->
-               IO (Either SomeException (Maybe (Val v)))
+               IO (CachedVal v)
 cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
   where
     cachedOrIO_
@@ -164,64 +172,59 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
       pk fromIO =
           join $ atomically $ TM.lookup pk storeKV >>= \case
                 Just x  ->
-                  return $ return $ Right (Just x)
+                  return $ return $ Right (Exists x)
                 Nothing ->
                   TM.lookup pk valAtoms >>= \case
                     Nothing                           -> startAsync >>= \a -> return (a >>= waitAndUpdateStore)
-                    Just DoIO                         -> retry
-                    Just RetryIO                      -> retry
+                    Just PerformingIO                 -> retry
+                    Just RetryingIO                   -> retry
                     Just (PromiseVal a)               -> return $ waitAndUpdateStore a
                     Just (BrokenVal e t)              -> returnErrorOrRetry e t
-
-                    {- TODO Replace Maybe with a type with 3 values:
-                      Absent | BeingPrepared | Present (Val a)
-                      to distinguish betweet "no value" situation and
-                      "wait a second, it's being prepared in 2-PC"
-                    -}
-                    Just (PreparedVal (Add _))        -> return $ return $ Right Nothing
-
-                    Just (PreparedVal (Update old _)) -> return $ return $ Right (Just old)
+                    Just (PreparedVal (Add _))        -> return $ return $ Right Unknown
+                    Just (PreparedVal (Update old _)) -> return $ return $ Right (Exists old)
 
       where
+        setAtom a = TM.insert a pk valAtoms
+        clearAtom = TM.delete pk valAtoms
 
-        returnErrorOrRetry :: SomeException -> UTCTime -> STM (IO (Either SomeException (Maybe (Val v))))
+        returnErrorOrRetry :: SomeException -> UTCTime -> STM (IO (Either SomeException (ResultVal (Val v))))
         returnErrorOrRetry e t = do
-          TM.insert RetryIO pk valAtoms
-          return $ mask_ $ case errorCaching of
+          setAtom RetryingIO
+          return $ case errorCaching of
                     NoErrorCaching      -> return $ Left e
-                    TimedCaching period -> do
+                    TimedCaching period -> mask_ $ do
                       ct <- getCurrentTime
                       if longEnough period ct t
                         then join (atomically startAsync) >>= waitAndUpdateStore
                         else do
                           atomically $ TM.lookup pk valAtoms >>= \case
-                              Just RetryIO -> TM.insert (BrokenVal e t) pk valAtoms
-                              _                                 -> return ()
+                              Just RetryingIO -> setAtom (BrokenVal e t)
+                              _               -> return ()
                           return $ Left e
 
         startAsync :: STM (IO (Async (Maybe (Val v))))
         startAsync = do
-          TM.insert DoIO pk valAtoms
+          setAtom PerformingIO
           return $ mask_ $ do
             a <- async (fromIO pk)
             -- TODO Add some serial number to every promise so that
             -- it would be possible to keep track of which promise it is
-            atomically $ TM.insert (PromiseVal a) pk valAtoms
+            atomically $ setAtom (PromiseVal a)
             return a
 
 
-        waitAndUpdateStore :: Async (Maybe (Val v)) -> IO (Either SomeException (Maybe (Val v)))
+        waitAndUpdateStore :: Async (Maybe (Val v)) -> IO (Either SomeException (ResultVal (Val v)))
         waitAndUpdateStore a = do
           r <- waitCatch a
           case (r, errorCaching) of
             (Right v, _) -> do
                 atomically $ do
                   forM_ v (resolve store va pk)
-                  TM.delete pk valAtoms
-                return (Right v)
+                  clearAtom
+                return $ Right $ toResultVal v
 
             (Left e, NoErrorCaching) -> do
-              atomically $ TM.delete pk valAtoms
+              atomically clearAtom
               return $ Left e
 
             (Left e, TimedCaching _) -> do
@@ -230,16 +233,9 @@ cachedOrIO CacheStore {..} = cachedOrIO_ valAtoms store
               -}
               time <- getCurrentTime
               -- TODO Add some check here to know what exactly are we replacing
-              atomically $ TM.insert (BrokenVal e time) pk valAtoms
+              atomically $ setAtom (BrokenVal e time)
               return (Left e)
 
-        longEnough :: NominalDiffTime -> UTCTime -> UTCTime -> Bool
-        longEnough period utc1 utc2 = diffUTCTime utc1 utc2 > period
-
-{-
-
-
--}
 
 indexCachedOrIO :: forall pk v i ixs .
                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, TListLookup ixs i)  =>
@@ -247,7 +243,7 @@ indexCachedOrIO :: forall pk v i ixs .
                    i ->
                    (i -> IO [(pk, Val v)]) ->
                    IO (Either SomeException [(pk, Val v)])
-indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
+indexCachedOrIO cs @ CacheStore {..} i =
   indexCachedOrIO_ idxAtoms valAtoms store i
   where
     AtomIdx idxAtoms = getIdxAtom cs i
@@ -255,52 +251,134 @@ indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
         (Atoms idxAtoms)
         va@(Atoms valAtoms)
         store@(IdxSet (Store storeKV) idxs)
-        i fromIO = do
-          x <- join $ atomically $ getByIndex store i >>= \case
-                Just values -> return . return $ Value_ values
+        i fromIO =
+           join $ atomically $ getByIndex store i >>= \case
+                Just values ->
+                  return . return $ Right values
                 Nothing     ->
                   TM.lookup i idxAtoms >>= \case
-                    Nothing -> do
-                      TM.insert IOIdx i idxAtoms
-                      return $ mask_ $ do
-                        a <- async (fromIO i)
-                        atomically $ TM.insert (PromiseIdx a) i idxAtoms
-                        return $ Promise_ a
-                    Just IOIdx -> retry
-                    Just (PromiseIdx a) -> return $ return $ Promise_ a
-                    Just (BrokenIdx e)  -> return $ return $ Broken_ e
-          case x of
-            Value_ v   -> return $ Right v
-            Promise_ a -> waitCatch a >>= atomically . updateStore
-            Broken_ e  -> return $ Left e
+                    Nothing              -> startAsync >>= \a -> return (a >>= waitAndUpdateStore)
+                    Just IOIdx           -> retry
+                    Just RetryingIOIdx   -> retry
+                    Just (PromiseIdx a)  -> return $ waitAndUpdateStore a
+                    Just (BrokenIdx e t) -> returnErrorOrRetry e t
 
       where
-        updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
-        updateStore ioResult = do
-          atom' <- TM.lookup i idxAtoms
-          case (atom', ioResult) of
-            (Nothing, _) ->
-              -- That means another client has called 'removeAtom'
-              -- so just don't do anything here
-              return ioResult
-            (Just (BrokenIdx e), Left exception) -> do
-              TM.insert (BrokenIdx exception) i idxAtoms
-              return (Left exception)
+        setAtom a = TM.insert a i idxAtoms
+        clearAtom = TM.delete i idxAtoms
 
-            (Just _, Left exception) -> do
-              TM.insert (BrokenIdx exception) i idxAtoms
-              return (Left exception)
+        returnErrorOrRetry :: SomeException -> UTCTime -> STM (IO (Either SomeException [(pk, Val v)]))
+        returnErrorOrRetry e t = do
+          setAtom RetryingIOIdx
+          return $ case errorCaching of
+              NoErrorCaching      -> return $ Left e
+              TimedCaching period -> mask_ $ do
+                ct <- getCurrentTime
+                if longEnough period ct t
+                  then join (atomically startAsync) >>= waitAndUpdateStore
+                  else do
+                    atomically $ TM.lookup i idxAtoms >>= \case
+                        Just RetryingIOIdx -> setAtom (BrokenIdx e t)
+                        _                  -> return ()
+                    return $ Left e
 
-            (_, Right values) -> do
-              updateValues values
-              return (Right values)
+        startAsync :: STM (IO (Async [(pk, Val v)]))
+        startAsync = do
+          setAtom IOIdx
+          return $ mask_ $ do
+            a <- async (fromIO i)
+            -- TODO Add some serial number to every promise so that
+            -- it would be possible to keep track of which promise it is
+            atomically $ setAtom (PromiseIdx a)
+            return a
 
-          where
-            updateValues :: [(pk, Val v)] -> STM ()
-            updateValues values = do
-                insertIntoIdx store i (map fst values)
-                forM_ values (uncurry (resolve store va))
-                TM.delete i idxAtoms
+
+        waitAndUpdateStore :: Async [(pk, Val v)] -> IO (Either SomeException [(pk, Val v)])
+        waitAndUpdateStore a = do
+          r <- waitCatch a
+          case (r, errorCaching) of
+            (Right values, _) -> do
+                atomically $ do
+                  insertIntoIdx store i (map fst values)
+                  forM_ values $ uncurry (resolve store va)
+                  clearAtom
+                return $ Right values
+
+            (Left e, NoErrorCaching) -> do
+              atomically clearAtom
+              return $ Left e
+
+            (Left e, TimedCaching _) -> do
+              {- TODO getCurrentTime is pretty slow and to avoid multiple calls
+                 we could move it inside of the async (fromIO pk) computation
+              -}
+              time <- getCurrentTime
+              -- TODO Add some check here to know what exactly are we replacing
+              atomically $ setAtom (BrokenIdx e time)
+              return $ Left e
+
+
+-- indexCachedOrIO :: forall pk v i ixs .
+--                    (Eq pk, Hashable pk, Eq i, Hashable i, Eq v, TListLookup ixs i)  =>
+--                    CacheStore pk (Val v) ixs ->
+--                    i ->
+--                    (i -> IO [(pk, Val v)]) ->
+--                    IO (Either SomeException [(pk, Val v)])
+-- indexCachedOrIO cs @ CacheStore { store = store, valAtoms = valAtoms } i =
+--   indexCachedOrIO_ idxAtoms valAtoms store i
+--   where
+--     AtomIdx idxAtoms = getIdxAtom cs i
+--     indexCachedOrIO_
+--         (Atoms idxAtoms)
+--         va@(Atoms valAtoms)
+--         store@(IdxSet (Store storeKV) idxs)
+--         i fromIO = do
+--           x <- join $ atomically $ getByIndex store i >>= \case
+--                 Just values ->
+--                   return . return $ Value_ values
+--                 Nothing     ->
+--                   TM.lookup i idxAtoms >>= \case
+--                     Nothing -> do
+--                       TM.insert IOIdx i idxAtoms
+--                       return $ mask_ $ do
+--                         a <- async (fromIO i)
+--                         atomically $ TM.insert (PromiseIdx a) i idxAtoms
+--                         return $ Promise_ a
+--                     Just IOIdx -> retry
+--                     Just (PromiseIdx a) -> return $ return $ Promise_ a
+--                     Just (BrokenIdx e _)  -> return $ return $ Broken_ e
+--           case x of
+--             Value_ v   -> return $ Right v
+--             Promise_ a -> waitCatch a >>= atomically . updateStore
+--             Broken_ e  -> return $ Left e
+--
+--       where
+--         updateStore :: Either SomeException [(pk, Val v)] -> STM (Either SomeException [(pk, Val v)])
+--         updateStore ioResult = do
+--           atom' <- TM.lookup i idxAtoms
+--           case (atom', ioResult) of
+--             (Nothing, _) ->
+--               -- That means another client has called 'removeAtom'
+--               -- so just don't do anything here
+--               return ioResult
+--             (Just (BrokenIdx e t), Left exception) -> do
+--               TM.insert (BrokenIdx exception t) i idxAtoms
+--               return (Left exception)
+--
+--             (Just _, Left exception) -> do
+--               TM.insert (BrokenIdx exception t) i idxAtoms
+--               return (Left exception)
+--
+--             (_, Right values) -> do
+--               updateValues values
+--               return (Right values)
+--
+--           where
+--             updateValues :: [(pk, Val v)] -> STM ()
+--             updateValues values = do
+--                 insertIntoIdx store i (map fst values)
+--                 forM_ values (uncurry (resolve store va))
+--                 TM.delete i idxAtoms
 
 
 getIdxAtom :: TListLookup ixs ix => CacheStore pk v ixs -> ix -> AtomIdx pk v ix
@@ -329,3 +407,6 @@ resolve
           PreparedVal _ -> return ()
     where
       insertToStore = TM.insert val pk storeKV
+
+longEnough :: NominalDiffTime -> UTCTime -> UTCTime -> Bool
+longEnough period utc1 utc2 = diffUTCTime utc1 utc2 > period
