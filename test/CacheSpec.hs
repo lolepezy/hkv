@@ -181,8 +181,8 @@ cache_or_io_much_not_cache_errors_by_default = do
   counters <- atomically (mkCounters [pk])
   c <- atomically $ newTVar (Counter 0)
 
-  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
+  r1 :: Cache.CachedVal Entry <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Cache.CachedVal Entry <- Cache.cachedOrIO store pk (ioWithSuccess c)
 
   Counter n <- readTVarIO c
   HU.assert $ n == 2
@@ -200,8 +200,8 @@ cache_or_io_must_cache_errors_for_period_of_time = do
   counters <- atomically (mkCounters [pk])
   c <- atomically $ newTVar (Counter 0)
 
-  r1 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithError c)
-  r2 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
+  r1 :: Cache.CachedVal Entry <- Cache.cachedOrIO store pk (ioWithError c)
+  r2 :: Cache.CachedVal Entry <- Cache.cachedOrIO store pk (ioWithSuccess c)
 
   Counter n <- readTVarIO c
   HU.assert $ n == 1
@@ -212,7 +212,7 @@ cache_or_io_must_cache_errors_for_period_of_time = do
 
   threadDelay (150*1000 :: Int)
 
-  r3 :: Either SomeException (Maybe (Cache.Val Entry)) <- Cache.cachedOrIO store pk (ioWithSuccess c)
+  r3 :: Cache.CachedVal Entry <- Cache.cachedOrIO store pk (ioWithSuccess c)
   Counter n <- readTVarIO c
   HU.assert $ n == 2
   (be1, se1, ve1) <- atomically $ atomsAreEmpty store
