@@ -93,7 +93,7 @@ inc pk counters = do
 uniqueEntries :: Monad m => PropertyM m [Entry]
 uniqueEntries = nubBy (\(k1, _, _) (k2, _, _)-> k1 == k2) <$> pick QC.arbitrary
 
-atomsAreEmpty :: Cache.CacheStore IKey (Cache.Val Entry) EntryIdxs -> STM (Bool, Bool, Bool)
+atomsAreEmpty :: Cache.CacheStore IKey (Cache.Val Entry) EntryIdxs caching -> STM (Bool, Bool, Bool)
 atomsAreEmpty store = do
   let (Cache.Atoms valAtoms) = Cache.valAtoms store
   let (Cache.AtomIdx (Cache.Atoms sIdx)) = Cache.getIdxAtom store ("" :: String)
@@ -134,7 +134,6 @@ prop_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
 prop_idx_cache_or_io_should_invoke_io_exactly_once :: QC.Property
 prop_idx_cache_or_io_should_invoke_io_exactly_once = monadicIO $ do
   entries <- uniqueEntries
-
   store <- run mkTestStore
 
   requestIdxKeys <- requestPks $ map (\(_, s, _) -> s) entries
@@ -162,7 +161,7 @@ data SomeIOProblem = SomeIOProblem deriving (Show, Typeable)
 
 instance Exception SomeIOProblem
 
-ioWithError :: TVar Counter -> IKey -> IO (Maybe (Cache.Val Entry))
+ioWithError :: TVar Counter -> pk -> IO t
 ioWithError c pk = do
     atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
     throw SomeIOProblem
@@ -171,6 +170,12 @@ ioWithSuccess :: TVar Counter -> IKey -> IO (Maybe (Cache.Val Entry))
 ioWithSuccess c pk = do
     atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
     return $ Just $ Cache.Val (pk, "whatever", True) (Cache.Version 1)
+
+ioWithSuccessIdx :: IKey -> TVar Counter -> i -> IO [(IKey, Cache.Val Entry)]
+ioWithSuccessIdx pk c i = do
+    atomically $ modifyTVar' c $ \(Counter c') -> Counter (c' + 1)
+    return [(pk, Cache.Val (pk, "whatever", True) (Cache.Version 1))]
+
 
 cache_or_io_much_not_cache_errors_by_default :: HU.Assertion
 cache_or_io_much_not_cache_errors_by_default = do
@@ -221,6 +226,55 @@ cache_or_io_must_cache_errors_for_period_of_time = do
   HU.assert ve1
 
 
+cache_or_io_much_not_cache_errors_by_default_idx :: HU.Assertion
+cache_or_io_much_not_cache_errors_by_default_idx = do
+  let e = (IKey 1, "1", False)
+  let pk = primaryKey e
+
+  store <- mkTestStore
+  counters <- atomically (mkCounters [pk])
+  c <- atomically $ newTVar (Counter 0)
+
+  r1 <- Cache.indexCachedOrIO store ("1" :: String) (ioWithError c)
+  r2 <- Cache.indexCachedOrIO store ("1" :: String) (ioWithSuccessIdx (IKey 1) c)
+
+  Counter n <- readTVarIO c
+  HU.assert $ n == 2
+  (be, se, ve) <- atomically $ atomsAreEmpty store
+  HU.assert be
+  HU.assert se
+  HU.assert ve
+
+
+cache_or_io_must_cache_errors_for_period_of_time_idx :: HU.Assertion
+cache_or_io_must_cache_errors_for_period_of_time_idx = do
+  let e = (IKey 1, "1", False)
+  let pk = primaryKey e
+
+  store <- mkTestStoreWithConf (Cache.CacheConf (Cache.TimedCaching 0.1))
+  counters <- atomically (mkCounters [pk])
+  c <- atomically $ newTVar (Counter 0)
+
+  r1 <- Cache.indexCachedOrIO store ("1" :: String) (ioWithError c)
+  r2 <- Cache.indexCachedOrIO store ("1" :: String) (ioWithSuccessIdx (IKey 1) c)
+
+  Counter n <- readTVarIO c
+  HU.assert $ n == 1
+  (be, se, ve) <- atomically $ atomsAreEmpty store
+  HU.assert be
+  HU.assert (not se)
+  HU.assert ve
+
+  threadDelay (150*1000 :: Int)
+
+  r3 <- Cache.indexCachedOrIO store ("1" :: String) (ioWithSuccessIdx (IKey 1) c)
+  Counter n <- readTVarIO c
+  HU.assert $ n == 2
+  (be1, se1, ve1) <- atomically $ atomsAreEmpty store
+  HU.assert be1
+  HU.assert se1
+  HU.assert ve1
+
 qcProps = testGroup "Cache properties"
   [
     QC.testProperty "IO should happen exactly once" prop_cache_or_io_should_invoke_io_exactly_once
@@ -230,7 +284,9 @@ qcProps = testGroup "Cache properties"
 unitTests = testGroup "Unit tests"
   [
     HU.testCase "Don't cache error by default" cache_or_io_much_not_cache_errors_by_default,
-    HU.testCase "Cache errors for 0.5 second" cache_or_io_must_cache_errors_for_period_of_time
+    HU.testCase "Don't cache error by default in IDX queries" cache_or_io_much_not_cache_errors_by_default_idx,
+    HU.testCase "Cache errors for 0.5 second" cache_or_io_must_cache_errors_for_period_of_time,
+    HU.testCase "Cache errors for 0.5 second in IDX queries" cache_or_io_must_cache_errors_for_period_of_time_idx
   ]
 
 
